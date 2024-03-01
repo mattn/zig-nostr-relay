@@ -98,6 +98,18 @@ const Handler = struct {
         return false;
     }
 
+    fn eventMatched(event: Event, filters: std.ArrayList(Filter)) bool {
+        for (filters.items) |filter| {
+            if (idInSlice(filter.ids.items, event.id)) return true;
+            if (idInSlice(filter.authors.items, event.pubkey)) return true;
+            if (tagsInSlice(filter.tags.items, event.tags)) return true;
+            if (kindInSlice(filter.kinds.items, event.kind)) return true;
+            if (filter.since > 0 and event.created_at >= filter.since) return true;
+            if (filter.until > 0 and event.created_at <= filter.until) return true;
+        }
+        return false;
+    }
+
     pub fn handle(self: *Handler, message: Message) !void {
         const data = message.data;
         std.debug.print("{s}\n", .{data});
@@ -115,17 +127,8 @@ const Handler = struct {
             const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, parsed.value.array.items[1], .{});
             try self.context.events.append(parsedEvent.value);
 
-            var found: bool = false;
             for (self.context.subscribers.items) |subscriber| {
-                for (subscriber.filters.items) |filter| {
-                    if (idInSlice(filter.ids.items, parsedEvent.value.id)) found = true;
-                    if (idInSlice(filter.authors.items, parsedEvent.value.pubkey)) found = true;
-                    if (tagsInSlice(filter.tags.items, parsedEvent.value.tags)) found = true;
-                    if (kindInSlice(filter.kinds.items, parsedEvent.value.kind)) found = true;
-                    if (filter.since > 0 and parsedEvent.value.created_at >= filter.since) found = true;
-                    if (filter.until > 0 and parsedEvent.value.created_at <= filter.until) found = true;
-                }
-                if (!found) continue;
+                if (!eventMatched(parsedEvent.value, subscriber.filters)) continue;
 
                 var buf = std.ArrayList(u8).init(self.context.allocator);
                 defer buf.deinit();
@@ -229,6 +232,8 @@ const Handler = struct {
             });
 
             for (self.context.events.items) |event| {
+                if (!eventMatched(event, filters)) continue;
+
                 var buf = std.ArrayList(u8).init(self.context.allocator);
                 defer buf.deinit();
                 var jw = std.json.writeStream(buf.writer(), .{});
