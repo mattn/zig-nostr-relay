@@ -110,6 +110,19 @@ const Handler = struct {
         return false;
     }
 
+    fn delete_record_by_id(events: *std.ArrayList(Event), tag: [][]u8) i32 {
+        for (events.items, 0..) |event, i| {
+            for (event.tags) |item| {
+                if (item.len != 2) continue;
+                if (std.mem.eql(u8, item[0], tag[0]) and std.mem.eql(u8, item[1], tag[1])) {
+                    _ = events.orderedRemove(i);
+                    return 0;
+                }
+            }
+        }
+        return -1;
+    }
+
     fn delete_record_by_kind_and_pubkey(events: *std.ArrayList(Event), kind: i32, pubkey: []u8) i32 {
         for (events.items, 0..) |event, i| {
             if (event.kind != kind or !std.mem.eql(u8, event.pubkey, pubkey)) continue;
@@ -151,6 +164,14 @@ const Handler = struct {
             const ev = parsedEvent.value;
 
             if (ev.kind == 5) {
+                for (ev.tags) |tag| {
+                    if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) {
+                        if (delete_record_by_id(&self.context.events, tag[1..]) < 0) {
+                            return;
+                        }
+                    }
+                }
+            } else {
                 if (20000 <= ev.kind and ev.kind < 30000) {} else if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
                     if (delete_record_by_kind_and_pubkey(&self.context.events, ev.kind, ev.pubkey) < 0) {
                         return;
@@ -164,7 +185,6 @@ const Handler = struct {
                         }
                     }
                 }
-            } else {
                 try self.context.events.append(ev);
             }
 
