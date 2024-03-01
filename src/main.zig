@@ -110,6 +110,29 @@ const Handler = struct {
         return false;
     }
 
+    fn delete_record_by_kind_and_pubkey(events: *std.ArrayList(Event), kind: i32, pubkey: []u8) i32 {
+        for (events.items, 0..) |event, i| {
+            if (event.kind != kind or !std.mem.eql(u8, event.pubkey, pubkey)) continue;
+            _ = events.orderedRemove(i);
+            return 0;
+        }
+        return -1;
+    }
+
+    fn delete_record_by_kind_and_pubkey_and_dtag(events: *std.ArrayList(Event), kind: i32, pubkey: []u8, tag: [][]u8) i32 {
+        for (events.items, 0..) |event, i| {
+            if (event.kind != kind or !std.mem.eql(u8, event.pubkey, pubkey)) continue;
+            for (event.tags) |item| {
+                if (item.len != 2) continue;
+                if (std.mem.eql(u8, item[0], tag[0]) and std.mem.eql(u8, item[1], tag[1])) {
+                    _ = events.orderedRemove(i);
+                    return 0;
+                }
+            }
+        }
+        return -1;
+    }
+
     pub fn handle(self: *Handler, message: Message) !void {
         const data = message.data;
         std.debug.print("{s}\n", .{data});
@@ -125,10 +148,28 @@ const Handler = struct {
         }
         if (std.mem.eql(u8, parsed.value.array.items[0].string, "EVENT")) {
             const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, parsed.value.array.items[1], .{});
-            try self.context.events.append(parsedEvent.value);
+            const ev = parsedEvent.value;
+
+            if (ev.kind == 5) {
+                if (20000 <= ev.kind and ev.kind < 30000) {} else if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
+                    if (delete_record_by_kind_and_pubkey(&self.context.events, ev.kind, ev.pubkey) < 0) {
+                        return;
+                    }
+                } else if (30000 <= ev.kind and ev.kind < 40000) {
+                    for (ev.tags) |tag| {
+                        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "d")) {
+                            if (delete_record_by_kind_and_pubkey_and_dtag(&self.context.events, ev.kind, ev.pubkey, tag) < 0) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else {
+                try self.context.events.append(ev);
+            }
 
             for (self.context.subscribers.items) |subscriber| {
-                if (!eventMatched(parsedEvent.value, subscriber.filters)) continue;
+                if (!eventMatched(ev, subscriber.filters)) continue;
 
                 var buf = std.ArrayList(u8).init(self.context.allocator);
                 defer buf.deinit();
@@ -137,14 +178,14 @@ const Handler = struct {
                 try jw.beginArray();
                 try jw.write("EVENT");
                 try jw.write(subscriber.sub);
-                try jw.write(parsedEvent.value);
+                try jw.write(ev);
                 try jw.endArray();
                 try subscriber.client.conn.write(buf.items);
             }
 
             const result = [_]std.json.Value{
                 .{ .string = "OK" },
-                .{ .string = parsedEvent.value.id },
+                .{ .string = ev.id },
                 .{ .bool = true },
                 .{ .string = "" },
             };
