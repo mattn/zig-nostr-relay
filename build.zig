@@ -30,6 +30,18 @@ pub fn build(b: *std.Build) void {
     });
     exe.addModule("websocket", websocket.module("websocket"));
 
+    const pg = b.dependency("pg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.addModule("pg", pg.module("pg"));
+
+    const struct_env = b.dependency("struct_env", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.addModule("struct-env", struct_env.module("struct-env"));
+
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
     // step when running `zig build`).

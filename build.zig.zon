@@ -19,6 +19,14 @@
             .url = "https://github.com/karlseguin/websocket.zig/archive/bfde1ac5853ca69c0397888c4c759014b40ef3fa.tar.gz",
             .hash = "1220361c4b45f9dbffa9972997298b9137741ac2ad67a41a38396e9d27e734e52128"
         },
+        .pg = .{
+            .url = "https://github.com/karlseguin/pg.zig/archive/f3f4a0b3b9996bfb1bf9bd0bdd0d73b36e915a86.tar.gz",
+            .hash = "1220337202642ee66408a35f254549f22cf3a096c6fa6c28e6f87a0161d5a6c0f4ab"
+        },
+        .struct_env= .{
+            .url = "https://github.com/Hanaasagi/struct-env/archive/219d367ff4d946993ba7f0bc893dca9a7d518dfb.tar.gz",
+            .hash = "1220b90ac9935ea2a8d79ed917a21648bb2ff74054587f542fead6c30a1de4692d47",
+        },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
