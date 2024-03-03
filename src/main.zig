@@ -55,11 +55,13 @@ const Context = struct {
 };
 
 const Config = struct {
-    db_host: []const u8 = "127.0.0.1",
+    db_host: []const u8 = "localhost",
     db_port: u16 = 5432,
     db_database: []const u8 = "zig-nostr-relay",
     db_username: []const u8 = "postgres",
     db_password: []const u8 = "postgres",
+    db_use_tls: bool = false,
+    db_ca_bundle: []const u8 = undefined,
     db_timeout: u32 = 10_000,
     relay_addr: []const u8 = "0.0.0.0",
     relay_port: u16 = 7447,
@@ -77,21 +79,61 @@ fn taggedHash(tag: []const u8, msg: []const u8) [32]u8 {
     return buf;
 }
 
+fn verify(public_key: [32]u8, msg: [32]u8, signature: [64]u8) !bool {
+    const Px = try Secp256k1.Fe.fromBytes(public_key, .Big);
+    const Py = try Secp256k1.recoverY(Px, false);
+    const P = try Secp256k1.fromAffineCoordinates(.{ .x = Px, .y = Py });
+    const r = try Secp256k1.Fe.fromBytes(signature[0..32].*, .Big);
+    const s = try Secp256k1.scalar.Scalar.fromBytes(signature[32..64].*, .Big);
+    var to_hash: [96]u8 = undefined;
+    @memcpy(to_hash[0..32], signature[0..32]);
+    @memcpy(to_hash[32..64], public_key[0..]);
+    @memcpy(to_hash[64..96], msg[0..]);
+    const e = try Scalar.fromBytes(
+        taggedHash("BIP0340/challenge", to_hash[0..]),
+        .Big,
+    );
+    const R = (try Secp256k1.basePoint.mulPublic(
+        s.toBytes(.Big),
+        .Big,
+    )).sub(try P.mul(e.toBytes(.Big), .Big));
+    if (R.affineCoordinates().y.isOdd()) {
+        return false;
+    }
+    if (!R.affineCoordinates().x.equivalent(r)) {
+        return false;
+    }
+    return true;
+}
+
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     const env = try struct_env.fromEnv(allocator, Config);
     defer struct_env.free(allocator, env);
 
-    var pool = pg.Pool.init(allocator, .{ .size = 5, .connect = .{
-        .port = env.db_port,
-        .host = env.db_host,
-    }, .auth = .{
-        .database = env.db_database,
-        .username = env.db_username,
-        .password = env.db_password,
-        .timeout = env.db_timeout,
-    } }) catch return;
+    std.debug.print("{s}\n", .{env.db_host});
+    var bundle = std.crypto.Certificate.Bundle{};
+    defer bundle.deinit(allocator);
+    if (env.db_ca_bundle.len > 0) {
+        try bundle.addCertsFromFilePath(allocator, std.fs.cwd(), "hub.crt");
+    }
+    std.debug.print("{} {s}\n", .{ env.db_use_tls, env.db_ca_bundle });
+    var pool = pg.Pool.init(allocator, .{
+        .size = 5,
+        .connect = .{
+            .port = env.db_port,
+            .host = env.db_host,
+            .tls = env.db_use_tls,
+            .ca_bundle = bundle,
+        },
+        .auth = .{
+            .database = env.db_database,
+            .username = env.db_username,
+            .password = env.db_password,
+            .timeout = env.db_timeout,
+        },
+    }) catch return;
     defer pool.deinit();
 
     var context = Context{
@@ -252,7 +294,7 @@ const Handler = struct {
         return try std.json.stringifyAlloc(allocator, tags.items, .{});
     }
 
-    fn check_event(allocator: std.mem.Allocator, ev: Event) !void {
+    fn verify_event(allocator: std.mem.Allocator, ev: Event) !bool {
         var tags = std.json.Array.init(allocator);
         defer tags.deinit();
         for (ev.tags) |tag| {
@@ -272,45 +314,24 @@ const Handler = struct {
             .{ .string = ev.content },
         };
 
-        //const scheme = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256oSha256;
-        //Ed25519
-        //const scheme = std.crypto.sign.Ed25519;
-        //const scheme = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
-        const scheme = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
-
-        //const scheme = std.crypto.sign.ecdsa.EcdsaP256Sha256;
-        ////const scheme = std.crypto.sign.Ed25519;
-        ////const scheme = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
-
-        var bytes_pk: [33]u8 = undefined;
-        //var bytes_sig: [64]u8 = undefined;
-
-        _ = try std.fmt.hexToBytes(bytes_pk[1..], ev.pubkey);
-        bytes_pk[0] = 0x02;
-        std.debug.print("{}\n", .{bytes_pk.len});
-        //var pk = try scheme.PublicKey.fromSec1(bytes_pk[0..33]);
-        var pk = try scheme.PublicKey.fromSec1(bytes_pk[0..33]);
-        //var pk = try scheme.PublicKey.fromBytes(bytes_pk[1..33].*);
+        var bytes_pk: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&bytes_pk, ev.pubkey);
+        var bytes_sig: [64]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&bytes_sig, ev.sig);
 
         const buf = try std.json.stringifyAlloc(allocator, result, .{});
         defer allocator.free(buf);
-        std.debug.print("{s}\n", .{buf});
 
-        //const msg = try std.fmt.hexToBytes(&msg_, vector.msg);
-        var sig_der_: [64]u8 = undefined;
-        //const sig_der = try std.fmt.hexToBytes(sig_der_[1..], ev.sig);
-        //const sig_der = try std.fmt.hexToBytes(&sig_der_, ev.sig);
-        _ = try std.fmt.hexToBytes(&sig_der_, ev.sig);
-        //_ = try std.fmt.hexToBytes(sig_der_[1..], ev.sig);
-        std.debug.print("{s}\n", .{"hogehoge"});
+        var msgbuf: [32]u8 = undefined;
+        var sha256 = Sha256.init(.{});
+        sha256.update(buf);
+        sha256.final(&msgbuf);
 
-        //const sig = try scheme.Signature.fromBytes(sig_der_[0..65]);
-        //const sig = try scheme.Signature.fromDer(sig_der_[0..]);
-        const sig = scheme.Signature.fromBytes(sig_der_);
-        //const sig = std.crypto.sign.Ed25519.Signature.fromBytes(sig_der_);
-
-        try sig.verify(buf, pk);
-        std.debug.print("{s}\n", .{"hogehoge"});
+        return try verify(
+            bytes_pk,
+            msgbuf,
+            bytes_sig,
+        );
     }
 
     fn make_filter(allocator: std.mem.Allocator, array: std.json.Array) !std.ArrayList(Filter) {
@@ -401,10 +422,14 @@ const Handler = struct {
             const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, parsed.value.array.items[1], .{});
             const ev = parsedEvent.value;
 
-            //check_event(self.context.allocator, ev) catch |err| {
-            //std.debug.print("error: {s}\n", .{@errorName(err)});
-            //return;
-            //};
+            const verified = verify_event(self.context.allocator, ev) catch |err| {
+                std.debug.print("error: {s}\n", .{@errorName(err)});
+                return;
+            };
+            if (!verified) {
+                std.debug.print("error: {s}\n", .{"invalid event signature"});
+                return;
+            }
 
             if (ev.kind == 5) {
                 for (ev.tags) |tag| {
