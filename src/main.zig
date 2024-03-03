@@ -67,6 +67,7 @@ const Config = struct {
     relay_port: u16 = 7447,
 };
 
+// https://github.com/vitalnodo/bip340/blob/main/bip340.zig
 fn taggedHash(tag: []const u8, msg: []const u8) [32]u8 {
     var buf: [32]u8 = undefined;
     Sha256.hash(tag, &buf, .{});
