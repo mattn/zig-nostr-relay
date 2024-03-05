@@ -300,7 +300,6 @@ const Handler = struct {
         defer tags.deinit();
         for (ev.tags) |tag| {
             var newtag = std.json.Array.init(allocator);
-            defer newtag.deinit();
             for (tag) |v| {
                 try newtag.append(std.json.Value{ .string = v });
             }
@@ -343,6 +342,10 @@ const Handler = struct {
                 .authors = std.ArrayList([]const u8).init(allocator),
                 .tags = std.ArrayList([][]const u8).init(allocator),
                 .kinds = std.ArrayList(i64).init(allocator),
+                .search = "",
+                .since = 0,
+                .until = 0,
+                .limit = 500,
             };
             for (elem.object.keys()) |key| {
                 if (std.mem.eql(u8, key, "ids")) {
@@ -436,6 +439,7 @@ const Handler = struct {
                 for (ev.tags) |tag| {
                     if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) {
                         if (delete_record_by_id(self.context.pool, tag[1..]) < 0) {
+                            try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
                             return;
                         }
                     }
@@ -443,12 +447,14 @@ const Handler = struct {
             } else {
                 if (20000 <= ev.kind and ev.kind < 30000) {} else if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
                     if (delete_record_by_kind_and_pubkey(self.context.pool, ev.kind, ev.pubkey) < 0) {
+                        try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
                         return;
                     }
                 } else if (30000 <= ev.kind and ev.kind < 40000) {
                     for (ev.tags) |tag| {
                         if (tag.len >= 2 and std.mem.eql(u8, tag[0], "d")) {
                             if (delete_record_by_kind_and_pubkey_and_dtag(self.context.pool, ev.kind, ev.pubkey, tag) < 0) {
+                                try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
                                 return;
                             }
                         }
@@ -456,13 +462,11 @@ const Handler = struct {
                 }
 
                 const tagsj = try make_tagsj(self.context.allocator, ev);
-                _ = tagsj;
-                //var tagsbj: []u8 = std.mem.bytesAsSlice(u8, tagsj[0..]);
                 const conn = try self.context.pool.acquire();
                 defer self.context.pool.release(conn);
                 _ = try conn.exec(
                     \\INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, "[]", ev.content, ev.sig });
+                , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, @constCast(tagsj), ev.content, ev.sig });
             }
 
             for (self.context.subscribers.items) |subscriber| {
@@ -504,11 +508,119 @@ const Handler = struct {
 
             const conn = try self.context.pool.acquire();
             defer self.context.pool.release(conn);
-            var res = try conn.query("select id, pubkey, created_at, kind, tags, content, sig from event order by created_at desc limit 500", .{});
+
+            const value = union(enum) {
+                number: i64,
+                string: []const u8,
+            };
+            var params = std.ArrayList(value).init(self.context.allocator);
+            defer params.deinit();
+
+            var condbuf = std.ArrayList([]u8).init(self.context.allocator);
+            defer condbuf.deinit();
+            var sqlbuf = std.ArrayList(u8).init(self.context.allocator);
+            defer sqlbuf.deinit();
+            var limit: u64 = 500;
+
+            const writer = sqlbuf.writer();
+            for (filters.items) |filter| {
+                if (filter.ids.items.len > 0) {
+                    var parambuf = std.ArrayList(u8).init(self.context.allocator);
+                    defer parambuf.deinit();
+                    for (filter.ids.items) |id| {
+                        try params.append(.{ .string = id });
+                        try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                        try parambuf.append(',');
+                    }
+                    if (parambuf.items.len > 0) {
+                        _ = parambuf.pop();
+                        try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "id in ({s})", .{parambuf.items}));
+                    }
+                }
+                if (filter.authors.items.len > 0) {
+                    var parambuf = std.ArrayList(u8).init(self.context.allocator);
+                    defer parambuf.deinit();
+                    for (filter.authors.items) |pubkey| {
+                        try params.append(.{ .string = pubkey });
+                        try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                        try parambuf.append(',');
+                    }
+                    if (parambuf.items.len > 0) {
+                        _ = parambuf.pop();
+                        try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "pubkey in ({s})", .{parambuf.items}));
+                    }
+                }
+                if (filter.kinds.items.len > 0) {
+                    var parambuf = std.ArrayList(u8).init(self.context.allocator);
+                    defer parambuf.deinit();
+                    for (filter.kinds.items) |kind| {
+                        try params.append(.{ .number = kind });
+                        try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                        try parambuf.append(',');
+                    }
+                    if (parambuf.items.len > 0) {
+                        _ = parambuf.pop();
+                        try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "kind in ({s})", .{parambuf.items}));
+                    }
+                }
+                if (filter.tags.items.len > 0) {
+                    var parambuf = std.ArrayList(u8).init(self.context.allocator);
+                    defer parambuf.deinit();
+                    for (filter.tags.items) |tag| {
+                        for (tag) |v| {
+                            try params.append(.{ .string = v });
+                            try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                            try parambuf.append(',');
+                        }
+                    }
+                    if (parambuf.items.len > 0) {
+                        _ = parambuf.pop();
+                        try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "tagvalues && ARRAY[{s}]", .{parambuf.items}));
+                    }
+                }
+                if (filter.since > 0) {
+                    try params.append(.{ .number = filter.since });
+                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "created_at >= ${}", .{params.items.len}));
+                }
+                if (filter.until > 0) {
+                    try params.append(.{ .number = filter.until });
+                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "created_at <= ${}", .{params.items.len}));
+                }
+                if (filter.search.len > 0) {
+                    try params.append(.{ .string = try std.fmt.allocPrint(self.context.allocator, "%{s}%", .{filter.search}) });
+                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "content LIKE ${}", .{params.items.len}));
+                }
+            }
+            try writer.print("select id, pubkey, created_at, kind, tags, content, sig from event", .{});
+            if (condbuf.items.len > 0) {
+                try writer.print(" where ", .{});
+                for (condbuf.items, 0..) |cond, i| {
+                    if (i > 0) try writer.print(" and ", .{});
+                    try writer.print("{s}", .{cond});
+                }
+            }
+            try writer.print(" order by created_at desc limit {}", .{limit});
+
+            var stmt = pg.Stmt.init(conn, .{});
+            errdefer stmt.deinit();
+
+            _ = stmt.prepare(sqlbuf.items) catch |err| {
+                std.debug.print("error: {s}\n", .{@errorName(err)});
+                return;
+            };
+            std.debug.print("{}\n", .{params.items.len});
+            for (params.items) |param| {
+                switch (param) {
+                    .number => |number| try stmt.bind(number),
+                    .string => |string| try stmt.bind(@constCast(string)),
+                }
+            }
+            var res = try stmt.execute();
             defer res.deinit();
 
             while (try res.next()) |row| {
                 var ev: Event = undefined;
+                if (row.values.len != 7) break;
                 ev.id = row.get([]u8, 0);
                 ev.pubkey = row.get([]u8, 1);
                 ev.created_at = row.get(i32, 2);

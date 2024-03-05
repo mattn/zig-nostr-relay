@@ -20,8 +20,8 @@
             .hash = "1220361c4b45f9dbffa9972997298b9137741ac2ad67a41a38396e9d27e734e52128"
         },
         .pg = .{
-            .url = "https://github.com/karlseguin/pg.zig/archive/899162558208342460322389337c00173ef715ee.tar.gz",
-            .hash = "1220a0c0a5de19b4572452fa19231abf31a336f2deb13096708243ed39bc86cb2b5a"
+            .url = "https://github.com/karlseguin/pg.zig/archive/e3af0b0b6f24ea87025e8278330e579cb3697b31.tar.gz",
+            .hash = "1220c6b327ab59bcdcf17411d1d840909ba09c44a58e6ca65a39ce10a11387bf862a"
         },
         .struct_env= .{
             .url = "https://github.com/Hanaasagi/struct-env/archive/219d367ff4d946993ba7f0bc893dca9a7d518dfb.tar.gz",
