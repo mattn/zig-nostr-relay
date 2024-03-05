@@ -261,7 +261,7 @@ const Handler = struct {
         const conn = try self.context.pool.acquire();
         defer self.context.pool.release(conn);
         var stmt = pg.Stmt.init(conn, .{});
-        errdefer stmt.deinit();
+        defer stmt.deinit();
 
         _ = stmt.prepare(sql) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
@@ -283,7 +283,7 @@ const Handler = struct {
         const conn = try self.context.pool.acquire();
         defer self.context.pool.release(conn);
         var stmt = pg.Stmt.init(conn, .{});
-        errdefer stmt.deinit();
+        defer stmt.deinit();
 
         _ = stmt.prepare("delete from event where kind = $1 and pubkey = $2") catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
@@ -324,7 +324,7 @@ const Handler = struct {
         const conn = try self.context.pool.acquire();
         defer self.context.pool.release(conn);
         var stmt = pg.Stmt.init(conn, .{});
-        errdefer stmt.deinit();
+        defer stmt.deinit();
 
         _ = stmt.prepare(sql) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
@@ -347,7 +347,6 @@ const Handler = struct {
         defer tags.deinit();
         for (ev.tags) |tag| {
             var tmptag = std.json.Array.init(allocator);
-            defer tmptag.deinit();
             for (tag) |v| {
                 try tmptag.append(std.json.Value{ .string = v });
             }
@@ -558,11 +557,11 @@ const Handler = struct {
                 try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
                 return;
             }
-            const sub = parsed.value.array.items[1].string;
+            var sub = parsed.value.array.items[1].string;
 
             const filters = try make_filter(self.context.allocator, parsed.value.array);
             try self.context.subscribers.append(.{
-                .sub = sub,
+                .sub = try self.context.allocator.dupe(u8, sub),
                 .client = self,
                 .filters = filters,
             });
@@ -665,7 +664,7 @@ const Handler = struct {
             try writer.print(" order by created_at desc limit {}", .{limit});
 
             var stmt = pg.Stmt.init(conn, .{});
-            errdefer stmt.deinit();
+            defer stmt.deinit();
 
             _ = stmt.prepare(sqlbuf.items) catch |err| {
                 std.debug.print("error: {s}\n", .{@errorName(err)});
