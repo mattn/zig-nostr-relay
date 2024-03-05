@@ -236,49 +236,110 @@ const Handler = struct {
         return false;
     }
 
-    fn delete_record_by_id(pool: *pg.Pool, tag: [][]u8) i32 {
-        _ = pool;
-        _ = tag;
-        //for (events.items, 0..) |event, i| {
-        //    for (event.tags) |item| {
-        //        if (item.len != 2) continue;
-        //        if (std.mem.eql(u8, item[0], tag[0]) and std.mem.eql(u8, item[1], tag[1])) {
-        //            _ = events.orderedRemove(i);
-        //            return 0;
-        //        }
-        //    }
-        //}
-        return -1;
+    fn delete_record_by_id(self: *Handler, tag: [][]u8) !bool {
+        const value = union(enum) {
+            number: i64,
+            string: []const u8,
+        };
+        var params = std.ArrayList(value).init(self.context.allocator);
+        defer params.deinit();
+        var parambuf = std.ArrayList(u8).init(self.context.allocator);
+        defer parambuf.deinit();
+
+        for (tag) |id| {
+            try params.append(.{ .string = id });
+            try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+            try parambuf.append(',');
+        }
+        if (parambuf.items.len == 0) return false;
+
+        _ = parambuf.pop();
+
+        var sql = try std.fmt.allocPrint(self.context.allocator, "delete from event where id in ({s})", .{parambuf.items});
+        defer self.context.allocator.free(sql);
+
+        const conn = try self.context.pool.acquire();
+        defer self.context.pool.release(conn);
+        var stmt = pg.Stmt.init(conn, .{});
+        errdefer stmt.deinit();
+
+        _ = stmt.prepare(sql) catch |err| {
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        for (params.items) |param| {
+            switch (param) {
+                .number => |number| try stmt.bind(number),
+                .string => |string| try stmt.bind(@constCast(string)),
+            }
+        }
+        var res = try stmt.execute();
+        defer res.deinit();
+
+        return true;
     }
 
-    fn delete_record_by_kind_and_pubkey(pool: *pg.Pool, kind: i64, pubkey: []u8) i32 {
-        _ = pool;
-        _ = kind;
-        _ = pubkey;
-        //for (events.items, 0..) |event, i| {
-        //    if (event.kind != kind or !std.mem.eql(u8, event.pubkey, pubkey)) continue;
-        //    _ = events.orderedRemove(i);
-        //    return 0;
-        //}
-        return -1;
+    fn delete_record_by_kind_and_pubkey(self: *Handler, kind: i64, pubkey: []u8) !bool {
+        const conn = try self.context.pool.acquire();
+        defer self.context.pool.release(conn);
+        var stmt = pg.Stmt.init(conn, .{});
+        errdefer stmt.deinit();
+
+        _ = stmt.prepare("delete from event where kind = $1 and pubkey = $2") catch |err| {
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        try stmt.bind(kind);
+        try stmt.bind(pubkey);
+
+        var res = try stmt.execute();
+        defer res.deinit();
+
+        return true;
     }
 
-    fn delete_record_by_kind_and_pubkey_and_dtag(pool: *pg.Pool, kind: i64, pubkey: []u8, tag: [][]u8) i32 {
-        _ = pool;
-        _ = kind;
-        _ = pubkey;
-        _ = tag;
-        //for (events.items, 0..) |event, i| {
-        //    if (event.kind != kind or !std.mem.eql(u8, event.pubkey, pubkey)) continue;
-        //    for (event.tags) |item| {
-        //        if (item.len != 2) continue;
-        //        if (std.mem.eql(u8, item[0], tag[0]) and std.mem.eql(u8, item[1], tag[1])) {
-        //            _ = events.orderedRemove(i);
-        //            return 0;
-        //        }
-        //    }
-        //}
-        return -1;
+    fn delete_record_by_kind_and_pubkey_and_dtag(self: *Handler, kind: i64, pubkey: []u8, tag: [][]u8) !bool {
+        const value = union(enum) {
+            number: i64,
+            string: []const u8,
+        };
+        var params = std.ArrayList(value).init(self.context.allocator);
+        defer params.deinit();
+        var parambuf = std.ArrayList(u8).init(self.context.allocator);
+        defer parambuf.deinit();
+        try params.append(.{ .number = kind });
+        try params.append(.{ .string = pubkey });
+        for (tag) |id| {
+            try params.append(.{ .string = id });
+            try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+            try parambuf.append(',');
+        }
+        if (parambuf.items.len == 0) return false;
+
+        _ = parambuf.pop();
+
+        var sql = try std.fmt.allocPrint(self.context.allocator, "delete from event where kind = $1 and pubkey = $2 and id in ({s})", .{parambuf.items});
+        defer self.context.allocator.free(sql);
+
+        const conn = try self.context.pool.acquire();
+        defer self.context.pool.release(conn);
+        var stmt = pg.Stmt.init(conn, .{});
+        errdefer stmt.deinit();
+
+        _ = stmt.prepare(sql) catch |err| {
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            return false;
+        };
+        for (params.items) |param| {
+            switch (param) {
+                .number => |number| try stmt.bind(number),
+                .string => |string| try stmt.bind(@constCast(string)),
+            }
+        }
+        var res = try stmt.execute();
+        defer res.deinit();
+
+        return true;
     }
 
     fn make_tagsj(allocator: std.mem.Allocator, ev: Event) ![]const u8 {
@@ -438,7 +499,7 @@ const Handler = struct {
             if (ev.kind == 5) {
                 for (ev.tags) |tag| {
                     if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) {
-                        if (delete_record_by_id(self.context.pool, tag[1..]) < 0) {
+                        if (!try self.delete_record_by_id(tag[1..])) {
                             try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
                             return;
                         }
@@ -446,14 +507,14 @@ const Handler = struct {
                 }
             } else {
                 if (20000 <= ev.kind and ev.kind < 30000) {} else if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
-                    if (delete_record_by_kind_and_pubkey(self.context.pool, ev.kind, ev.pubkey) < 0) {
+                    if (!try self.delete_record_by_kind_and_pubkey(ev.kind, ev.pubkey)) {
                         try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
                         return;
                     }
                 } else if (30000 <= ev.kind and ev.kind < 40000) {
                     for (ev.tags) |tag| {
                         if (tag.len >= 2 and std.mem.eql(u8, tag[0], "d")) {
-                            if (delete_record_by_kind_and_pubkey_and_dtag(self.context.pool, ev.kind, ev.pubkey, tag) < 0) {
+                            if (!try self.delete_record_by_kind_and_pubkey_and_dtag(ev.kind, ev.pubkey, tag)) {
                                 try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
                                 return;
                             }
@@ -518,11 +579,8 @@ const Handler = struct {
 
             var condbuf = std.ArrayList([]u8).init(self.context.allocator);
             defer condbuf.deinit();
-            var sqlbuf = std.ArrayList(u8).init(self.context.allocator);
-            defer sqlbuf.deinit();
-            var limit: u64 = 500;
 
-            const writer = sqlbuf.writer();
+            var limit: u64 = 500;
             for (filters.items) |filter| {
                 if (filter.ids.items.len > 0) {
                     var parambuf = std.ArrayList(u8).init(self.context.allocator);
@@ -591,6 +649,11 @@ const Handler = struct {
                     try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "content LIKE ${}", .{params.items.len}));
                 }
             }
+
+            var sqlbuf = std.ArrayList(u8).init(self.context.allocator);
+            defer sqlbuf.deinit();
+            const writer = sqlbuf.writer();
+
             try writer.print("select id, pubkey, created_at, kind, tags, content, sig from event", .{});
             if (condbuf.items.len > 0) {
                 try writer.print(" where ", .{});
@@ -608,7 +671,6 @@ const Handler = struct {
                 std.debug.print("error: {s}\n", .{@errorName(err)});
                 return;
             };
-            std.debug.print("{}\n", .{params.items.len});
             for (params.items) |param| {
                 switch (param) {
                     .number => |number| try stmt.bind(number),
