@@ -576,7 +576,7 @@ const Handler = struct {
             var condbuf = std.ArrayList([]u8).init(self.context.allocator);
             defer condbuf.deinit();
 
-            var limit: u64 = 500;
+            var limit: i64 = 500;
             for (filters.items) |filter| {
                 if (filter.ids.items.len > 0) {
                     var parambuf = std.ArrayList(u8).init(self.context.allocator);
@@ -643,6 +643,10 @@ const Handler = struct {
                 if (filter.search.len > 0) {
                     try params.append(.{ .string = try std.fmt.allocPrint(self.context.allocator, "%{s}%", .{filter.search}) });
                     try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "content LIKE ${}", .{params.items.len}));
+                }
+
+                if (filter.limit < limit) {
+                    limit = filter.limit;
                 }
             }
 
@@ -734,11 +738,15 @@ const Handler = struct {
         try self.conn.writeFrame(websocket.OpCode.close, &[_]u8{ 3, 232 });
     }
 
+    pub fn handlePing(self: *Handler, message: Message) !void {
+        try self.conn.writeFrame(websocket.OpCode.pong, message.data);
+    }
+
     pub fn handle(self: *Handler, message: Message) !void {
         switch (message.type) {
             .text => try self.handleText(message),
             .binary => try self.conn.write("[\"NOTICE\", \"error: invalid request\"]"),
-            .ping => try self.conn.writeFrame(websocket.OpCode.pong, message.data),
+            .ping => try self.handlePing(message),
             .pong => {},
             .close => try self.handleClose(message),
         }
