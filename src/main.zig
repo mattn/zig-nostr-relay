@@ -237,11 +237,11 @@ const Handler = struct {
     }
 
     fn delete_record_by_id(self: *Handler, tag: [][]u8) !bool {
-        const value = union(enum) {
+        const bindValue = union(enum) {
             number: i64,
             string: []const u8,
         };
-        var params = std.ArrayList(value).init(self.context.allocator);
+        var params = std.ArrayList(bindValue).init(self.context.allocator);
         defer params.deinit();
         var parambuf = std.ArrayList(u8).init(self.context.allocator);
         defer parambuf.deinit();
@@ -273,7 +273,7 @@ const Handler = struct {
                 .string => |string| try stmt.bind(@constCast(string)),
             }
         }
-        var res = try stmt.execute();
+        const res = try stmt.execute();
         defer res.deinit();
 
         return true;
@@ -292,18 +292,18 @@ const Handler = struct {
         try stmt.bind(kind);
         try stmt.bind(pubkey);
 
-        var res = try stmt.execute();
+        const res = try stmt.execute();
         defer res.deinit();
 
         return true;
     }
 
     fn delete_record_by_kind_and_pubkey_and_dtag(self: *Handler, kind: i64, pubkey: []u8, tag: [][]u8) !bool {
-        const value = union(enum) {
+        const bindValue = union(enum) {
             number: i64,
             string: []const u8,
         };
-        var params = std.ArrayList(value).init(self.context.allocator);
+        var params = std.ArrayList(bindValue).init(self.context.allocator);
         defer params.deinit();
         var parambuf = std.ArrayList(u8).init(self.context.allocator);
         defer parambuf.deinit();
@@ -336,7 +336,7 @@ const Handler = struct {
                 .string => |string| try stmt.bind(@constCast(string)),
             }
         }
-        var res = try stmt.execute();
+        const res = try stmt.execute();
         defer res.deinit();
 
         return true;
@@ -469,6 +469,251 @@ const Handler = struct {
         return filters;
     }
 
+    pub fn handleEvent(self: *Handler, value: std.json.Value) !void {
+        const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, value.array.items[1], .{});
+        const ev = parsedEvent.value;
+
+        const verified = verify_event(self.context.allocator, ev) catch |err| {
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            return;
+        };
+        if (!verified) {
+            std.debug.print("error: {s}\n", .{"invalid event signature"});
+            return;
+        }
+
+        if (ev.kind == 5) {
+            for (ev.tags) |tag| {
+                if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) {
+                    if (!try self.delete_record_by_id(tag[1..])) {
+                        try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
+                        return;
+                    }
+                }
+            }
+        } else {
+            if (20000 <= ev.kind and ev.kind < 30000) {} else if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
+                if (!try self.delete_record_by_kind_and_pubkey(ev.kind, ev.pubkey)) {
+                    try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
+                    return;
+                }
+            } else if (30000 <= ev.kind and ev.kind < 40000) {
+                for (ev.tags) |tag| {
+                    if (tag.len >= 2 and std.mem.eql(u8, tag[0], "d")) {
+                        if (!try self.delete_record_by_kind_and_pubkey_and_dtag(ev.kind, ev.pubkey, tag)) {
+                            try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
+                            return;
+                        }
+                    }
+                }
+            }
+
+            const tagsj = try make_tagsj(self.context.allocator, ev);
+            defer self.context.allocator.free(tagsj);
+            const db = try self.context.pool.acquire();
+            defer self.context.pool.release(db);
+            _ = db.exec(
+                \\insert into event (id, pubkey, created_at, kind, tags, content, sig) values ($1, $2, $3, $4, $5, $6, $7)
+            , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, @constCast(tagsj), ev.content, ev.sig }) catch |err| {
+                std.debug.print("error: {s}\n", .{@errorName(err)});
+            };
+        }
+
+        for (self.context.subscribers.items) |subscriber| {
+            if (!eventMatched(ev, subscriber.filters)) continue;
+
+            var buf = std.ArrayList(u8).init(self.context.allocator);
+            defer buf.deinit();
+            var jw = std.json.writeStream(buf.writer(), .{});
+            defer jw.deinit();
+            try jw.beginArray();
+            try jw.write("EVENT");
+            try jw.write(subscriber.sub);
+            try jw.write(ev);
+            try jw.endArray();
+            try subscriber.client.conn.write(buf.items);
+        }
+
+        const result = [_]std.json.Value{
+            .{ .string = "OK" },
+            .{ .string = ev.id },
+            .{ .bool = true },
+            .{ .string = "" },
+        };
+        const buf = try std.json.stringifyAlloc(self.context.allocator, result, .{});
+        defer self.context.allocator.free(buf);
+        try self.conn.write(buf);
+    }
+
+    pub fn handleReq(self: *Handler, value: std.json.Value) !void {
+        if (value.array.items.len < 3) {
+            try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
+            return;
+        }
+        var sub = value.array.items[1].string;
+
+        const filters = try make_filter(self.context.allocator, value.array);
+        try self.context.subscribers.append(.{
+            .sub = try self.context.allocator.dupe(u8, sub),
+            .client = self,
+            .filters = filters,
+        });
+
+        const bindValue = union(enum) {
+            number: i64,
+            string: []const u8,
+        };
+        var params = std.ArrayList(bindValue).init(self.context.allocator);
+        defer params.deinit();
+
+        var condbuf = std.ArrayList([]u8).init(self.context.allocator);
+        defer condbuf.deinit();
+
+        var limit: i64 = 500;
+        for (filters.items) |filter| {
+            if (filter.ids.items.len > 0) {
+                var parambuf = std.ArrayList(u8).init(self.context.allocator);
+                defer parambuf.deinit();
+                for (filter.ids.items) |id| {
+                    try params.append(.{ .string = id });
+                    try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                    try parambuf.append(',');
+                }
+                if (parambuf.items.len > 0) {
+                    _ = parambuf.pop();
+                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "id in ({s})", .{parambuf.items}));
+                }
+            }
+            if (filter.authors.items.len > 0) {
+                var parambuf = std.ArrayList(u8).init(self.context.allocator);
+                defer parambuf.deinit();
+                for (filter.authors.items) |pubkey| {
+                    try params.append(.{ .string = pubkey });
+                    try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                    try parambuf.append(',');
+                }
+                if (parambuf.items.len > 0) {
+                    _ = parambuf.pop();
+                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "pubkey in ({s})", .{parambuf.items}));
+                }
+            }
+            if (filter.kinds.items.len > 0) {
+                var parambuf = std.ArrayList(u8).init(self.context.allocator);
+                defer parambuf.deinit();
+                for (filter.kinds.items) |kind| {
+                    try params.append(.{ .number = kind });
+                    try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                    try parambuf.append(',');
+                }
+                if (parambuf.items.len > 0) {
+                    _ = parambuf.pop();
+                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "kind in ({s})", .{parambuf.items}));
+                }
+            }
+            if (filter.tags.items.len > 0) {
+                var parambuf = std.ArrayList(u8).init(self.context.allocator);
+                defer parambuf.deinit();
+                for (filter.tags.items) |tag| {
+                    for (tag) |v| {
+                        try params.append(.{ .string = v });
+                        try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                        try parambuf.append(',');
+                    }
+                }
+                if (parambuf.items.len > 0) {
+                    _ = parambuf.pop();
+                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "tagvalues && ARRAY[{s}]", .{parambuf.items}));
+                }
+            }
+            if (filter.since > 0) {
+                try params.append(.{ .number = filter.since });
+                try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "created_at >= ${}", .{params.items.len}));
+            }
+            if (filter.until > 0) {
+                try params.append(.{ .number = filter.until });
+                try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "created_at <= ${}", .{params.items.len}));
+            }
+            if (filter.search.len > 0) {
+                try params.append(.{ .string = try std.fmt.allocPrint(self.context.allocator, "%{s}%", .{filter.search}) });
+                try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "content LIKE ${}", .{params.items.len}));
+            }
+
+            if (filter.limit < limit) {
+                limit = filter.limit;
+            }
+        }
+
+        var sqlbuf = std.ArrayList(u8).init(self.context.allocator);
+        defer sqlbuf.deinit();
+        const writer = sqlbuf.writer();
+
+        try writer.print("select id, pubkey, created_at, kind, tags, content, sig from event", .{});
+        if (condbuf.items.len > 0) {
+            try writer.print(" where ", .{});
+            for (condbuf.items, 0..) |cond, i| {
+                if (i > 0) try writer.print(" and ", .{});
+                try writer.print("{s}", .{cond});
+            }
+        }
+        try writer.print(" order by created_at desc limit {}", .{limit});
+
+        const db = try self.context.pool.acquire();
+        defer self.context.pool.release(db);
+
+        var stmt = pg.Stmt.init(db, .{});
+        defer stmt.deinit();
+
+        _ = stmt.prepare(sqlbuf.items) catch |err| {
+            std.debug.print("error: {s}\n", .{@errorName(err)});
+            return;
+        };
+        for (params.items) |param| {
+            switch (param) {
+                .number => |number| try stmt.bind(number),
+                .string => |string| try stmt.bind(@constCast(string)),
+            }
+        }
+        var res = try stmt.execute();
+        defer res.deinit();
+
+        while (try res.next()) |row| {
+            var ev: Event = undefined;
+            if (row.values.len != 7) break;
+            ev.id = row.get([]u8, 0);
+            ev.pubkey = row.get([]u8, 1);
+            ev.created_at = row.get(i32, 2);
+            ev.kind = row.get(i32, 3);
+            var tagsj = row.get([]u8, 4);
+            const tags = try std.json.parseFromSliceLeaky([][][]u8, self.context.allocator, tagsj, .{});
+            ev.tags = tags;
+            ev.content = row.get([]u8, 5);
+            ev.sig = row.get([]u8, 6);
+
+            if (!eventMatched(ev, filters)) continue;
+
+            var buf = std.ArrayList(u8).init(self.context.allocator);
+            defer buf.deinit();
+            var jw = std.json.writeStream(buf.writer(), .{});
+            defer jw.deinit();
+            try jw.beginArray();
+            try jw.write("EVENT");
+            try jw.write(sub);
+            try jw.write(ev);
+            try jw.endArray();
+            try self.conn.write(buf.items);
+        }
+
+        const result = [_]std.json.Value{
+            .{ .string = "EOSE" },
+            .{ .string = sub },
+            .{ .bool = true },
+            .{ .string = "" },
+        };
+        const buf = try std.json.stringifyAlloc(self.context.allocator, result, .{});
+        defer self.context.allocator.free(buf);
+        try self.conn.write(buf);
+    }
+
     pub fn handleText(self: *Handler, message: Message) !void {
         const data = message.data;
         std.debug.print("{s}\n", .{data});
@@ -483,241 +728,9 @@ const Handler = struct {
             return;
         }
         if (std.mem.eql(u8, parsed.value.array.items[0].string, "EVENT")) {
-            const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, parsed.value.array.items[1], .{});
-            const ev = parsedEvent.value;
-
-            const verified = verify_event(self.context.allocator, ev) catch |err| {
-                std.debug.print("error: {s}\n", .{@errorName(err)});
-                return;
-            };
-            if (!verified) {
-                std.debug.print("error: {s}\n", .{"invalid event signature"});
-                return;
-            }
-
-            if (ev.kind == 5) {
-                for (ev.tags) |tag| {
-                    if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) {
-                        if (!try self.delete_record_by_id(tag[1..])) {
-                            try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
-                            return;
-                        }
-                    }
-                }
-            } else {
-                if (20000 <= ev.kind and ev.kind < 30000) {} else if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
-                    if (!try self.delete_record_by_kind_and_pubkey(ev.kind, ev.pubkey)) {
-                        try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
-                        return;
-                    }
-                } else if (30000 <= ev.kind and ev.kind < 40000) {
-                    for (ev.tags) |tag| {
-                        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "d")) {
-                            if (!try self.delete_record_by_kind_and_pubkey_and_dtag(ev.kind, ev.pubkey, tag)) {
-                                try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                const tagsj = try make_tagsj(self.context.allocator, ev);
-                const db = try self.context.pool.acquire();
-                defer self.context.pool.release(db);
-                _ = try db.exec(
-                    \\INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, @constCast(tagsj), ev.content, ev.sig });
-            }
-
-            for (self.context.subscribers.items) |subscriber| {
-                if (!eventMatched(ev, subscriber.filters)) continue;
-
-                var buf = std.ArrayList(u8).init(self.context.allocator);
-                defer buf.deinit();
-                var jw = std.json.writeStream(buf.writer(), .{});
-                defer jw.deinit();
-                try jw.beginArray();
-                try jw.write("EVENT");
-                try jw.write(subscriber.sub);
-                try jw.write(ev);
-                try jw.endArray();
-                try subscriber.client.conn.write(buf.items);
-            }
-
-            const result = [_]std.json.Value{
-                .{ .string = "OK" },
-                .{ .string = ev.id },
-                .{ .bool = true },
-                .{ .string = "" },
-            };
-            const buf = try std.json.stringifyAlloc(self.context.allocator, result, .{});
-            try self.conn.write(buf);
+            try self.handleEvent(parsed.value);
         } else if (std.mem.eql(u8, parsed.value.array.items[0].string, "REQ")) {
-            if (parsed.value.array.items.len < 3) {
-                try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
-                return;
-            }
-            var sub = parsed.value.array.items[1].string;
-
-            const filters = try make_filter(self.context.allocator, parsed.value.array);
-            try self.context.subscribers.append(.{
-                .sub = try self.context.allocator.dupe(u8, sub),
-                .client = self,
-                .filters = filters,
-            });
-
-            const value = union(enum) {
-                number: i64,
-                string: []const u8,
-            };
-            var params = std.ArrayList(value).init(self.context.allocator);
-            defer params.deinit();
-
-            var condbuf = std.ArrayList([]u8).init(self.context.allocator);
-            defer condbuf.deinit();
-
-            var limit: i64 = 500;
-            for (filters.items) |filter| {
-                if (filter.ids.items.len > 0) {
-                    var parambuf = std.ArrayList(u8).init(self.context.allocator);
-                    defer parambuf.deinit();
-                    for (filter.ids.items) |id| {
-                        try params.append(.{ .string = id });
-                        try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
-                        try parambuf.append(',');
-                    }
-                    if (parambuf.items.len > 0) {
-                        _ = parambuf.pop();
-                        try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "id in ({s})", .{parambuf.items}));
-                    }
-                }
-                if (filter.authors.items.len > 0) {
-                    var parambuf = std.ArrayList(u8).init(self.context.allocator);
-                    defer parambuf.deinit();
-                    for (filter.authors.items) |pubkey| {
-                        try params.append(.{ .string = pubkey });
-                        try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
-                        try parambuf.append(',');
-                    }
-                    if (parambuf.items.len > 0) {
-                        _ = parambuf.pop();
-                        try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "pubkey in ({s})", .{parambuf.items}));
-                    }
-                }
-                if (filter.kinds.items.len > 0) {
-                    var parambuf = std.ArrayList(u8).init(self.context.allocator);
-                    defer parambuf.deinit();
-                    for (filter.kinds.items) |kind| {
-                        try params.append(.{ .number = kind });
-                        try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
-                        try parambuf.append(',');
-                    }
-                    if (parambuf.items.len > 0) {
-                        _ = parambuf.pop();
-                        try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "kind in ({s})", .{parambuf.items}));
-                    }
-                }
-                if (filter.tags.items.len > 0) {
-                    var parambuf = std.ArrayList(u8).init(self.context.allocator);
-                    defer parambuf.deinit();
-                    for (filter.tags.items) |tag| {
-                        for (tag) |v| {
-                            try params.append(.{ .string = v });
-                            try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
-                            try parambuf.append(',');
-                        }
-                    }
-                    if (parambuf.items.len > 0) {
-                        _ = parambuf.pop();
-                        try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "tagvalues && ARRAY[{s}]", .{parambuf.items}));
-                    }
-                }
-                if (filter.since > 0) {
-                    try params.append(.{ .number = filter.since });
-                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "created_at >= ${}", .{params.items.len}));
-                }
-                if (filter.until > 0) {
-                    try params.append(.{ .number = filter.until });
-                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "created_at <= ${}", .{params.items.len}));
-                }
-                if (filter.search.len > 0) {
-                    try params.append(.{ .string = try std.fmt.allocPrint(self.context.allocator, "%{s}%", .{filter.search}) });
-                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "content LIKE ${}", .{params.items.len}));
-                }
-
-                if (filter.limit < limit) {
-                    limit = filter.limit;
-                }
-            }
-
-            var sqlbuf = std.ArrayList(u8).init(self.context.allocator);
-            defer sqlbuf.deinit();
-            const writer = sqlbuf.writer();
-
-            try writer.print("select id, pubkey, created_at, kind, tags, content, sig from event", .{});
-            if (condbuf.items.len > 0) {
-                try writer.print(" where ", .{});
-                for (condbuf.items, 0..) |cond, i| {
-                    if (i > 0) try writer.print(" and ", .{});
-                    try writer.print("{s}", .{cond});
-                }
-            }
-            try writer.print(" order by created_at desc limit {}", .{limit});
-
-            const db = try self.context.pool.acquire();
-            defer self.context.pool.release(db);
-
-            var stmt = pg.Stmt.init(db, .{});
-            defer stmt.deinit();
-
-            _ = stmt.prepare(sqlbuf.items) catch |err| {
-                std.debug.print("error: {s}\n", .{@errorName(err)});
-                return;
-            };
-            for (params.items) |param| {
-                switch (param) {
-                    .number => |number| try stmt.bind(number),
-                    .string => |string| try stmt.bind(@constCast(string)),
-                }
-            }
-            var res = try stmt.execute();
-            defer res.deinit();
-
-            while (try res.next()) |row| {
-                var ev: Event = undefined;
-                if (row.values.len != 7) break;
-                ev.id = row.get([]u8, 0);
-                ev.pubkey = row.get([]u8, 1);
-                ev.created_at = row.get(i32, 2);
-                ev.kind = row.get(i32, 3);
-                var tagsj = row.get([]u8, 4);
-                const tags = try std.json.parseFromSliceLeaky([][][]u8, self.context.allocator, tagsj, .{});
-                ev.tags = tags;
-                ev.content = row.get([]u8, 5);
-                ev.sig = row.get([]u8, 6);
-
-                if (!eventMatched(ev, filters)) continue;
-
-                var buf = std.ArrayList(u8).init(self.context.allocator);
-                defer buf.deinit();
-                var jw = std.json.writeStream(buf.writer(), .{});
-                defer jw.deinit();
-                try jw.beginArray();
-                try jw.write("EVENT");
-                try jw.write(sub);
-                try jw.write(ev);
-                try jw.endArray();
-                try self.conn.write(buf.items);
-            }
-
-            const result = [_]std.json.Value{
-                .{ .string = "EOSE" },
-                .{ .string = sub },
-                .{ .bool = true },
-                .{ .string = "" },
-            };
-            const buf = try std.json.stringifyAlloc(self.context.allocator, result, .{});
-            try self.conn.write(buf);
+            try self.handleReq(parsed.value);
         }
     }
 
