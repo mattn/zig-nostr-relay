@@ -461,6 +461,10 @@ const Handler = struct {
                     const search = elem.object.get(key);
                     if (search.? != .string) continue;
                     filter.search = search.?.string;
+                } else if (std.mem.eql(u8, key, "limit")) {
+                    const limit = elem.object.get(key);
+                    if (limit.? != .integer) continue;
+                    filter.limit = limit.?.integer;
                 }
             }
 
