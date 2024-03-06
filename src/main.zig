@@ -30,6 +30,7 @@ const Filter = struct {
     until: i64 = 0,
     limit: i64 = 0,
     search: []const u8 = undefined,
+    allocator: std.mem.Allocator,
 
     pub fn empty(self: *const Filter) bool {
         return self.ids.items.len == 0 and
@@ -40,12 +41,56 @@ const Filter = struct {
             self.until == 0 and
             self.search.len == 0;
     }
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return .{
+            .ids = std.ArrayList([]const u8).init(allocator),
+            .authors = std.ArrayList([]const u8).init(allocator),
+            .tags = std.ArrayList([][]const u8).init(allocator),
+            .kinds = std.ArrayList(i64).init(allocator),
+            .search = "",
+            .since = 0,
+            .until = 0,
+            .limit = 500,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.ids.deinit();
+        self.authors.deinit();
+        self.kinds.deinit();
+        self.tags.deinit();
+        if (self.search.len > 0) self.allocator.free(self.search);
+    }
 };
 
 const Subscriber = struct {
     sub: []const u8,
     client: *Handler,
-    filters: std.ArrayList(Filter),
+    filters: std.ArrayList(*Filter),
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, sub: []const u8, client: *Handler, filters: std.ArrayList(*Filter)) !Self {
+        return .{
+            .sub = try allocator.dupe(u8, sub),
+            .client = client,
+            .filters = filters,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        for (self.filters.items) |filter| {
+            filter.deinit();
+        }
+        self.filters.deinit();
+        if (self.sub.len > 0) self.allocator.free(self.sub);
+    }
 };
 
 const Context = struct {
@@ -223,7 +268,7 @@ const Handler = struct {
         return false;
     }
 
-    fn eventMatched(event: Event, filters: std.ArrayList(Filter)) bool {
+    fn eventMatched(event: Event, filters: std.ArrayList(*Filter)) bool {
         for (filters.items) |filter| {
             if (filter.empty()) return true;
             if (idInSlice(filter.ids.items, event.id)) return true;
@@ -398,19 +443,10 @@ const Handler = struct {
         );
     }
 
-    fn make_filter(allocator: std.mem.Allocator, array: std.json.Array) !std.ArrayList(Filter) {
-        var filters = std.ArrayList(Filter).init(allocator);
+    fn make_filter(allocator: std.mem.Allocator, array: std.json.Array) !std.ArrayList(*Filter) {
+        var filters = std.ArrayList(*Filter).init(allocator);
         for (array.items[2..]) |elem| {
-            var filter: Filter = .{
-                .ids = std.ArrayList([]const u8).init(allocator),
-                .authors = std.ArrayList([]const u8).init(allocator),
-                .tags = std.ArrayList([][]const u8).init(allocator),
-                .kinds = std.ArrayList(i64).init(allocator),
-                .search = "",
-                .since = 0,
-                .until = 0,
-                .limit = 500,
-            };
+            var filter = Filter.init(allocator);
             for (elem.object.keys()) |key| {
                 if (std.mem.eql(u8, key, "ids")) {
                     const ids = elem.object.get(key);
@@ -472,7 +508,7 @@ const Handler = struct {
                 }
             }
 
-            try filters.append(filter);
+            try filters.append(&filter);
         }
         return filters;
     }
@@ -561,11 +597,8 @@ const Handler = struct {
         var sub = value.array.items[1].string;
 
         const filters = try make_filter(self.context.allocator, value.array);
-        try self.context.subscribers.append(.{
-            .sub = try self.context.allocator.dupe(u8, sub),
-            .client = self,
-            .filters = filters,
-        });
+        const subscriber = try Subscriber.init(self.context.allocator, sub, self, filters);
+        try self.context.subscribers.append(subscriber);
 
         const bindValue = union(enum) {
             number: i64,
@@ -767,16 +800,8 @@ const Handler = struct {
     pub fn handleClose(self: *Handler, _: Message) !void {
         for (self.context.subscribers.items, 0..) |subscriber, i| {
             if (subscriber.client == self) {
-                self.context.allocator.free(subscriber.sub);
-                for (subscriber.filters.items) |filter| {
-                    filter.ids.deinit();
-                    filter.authors.deinit();
-                    filter.kinds.deinit();
-                    filter.tags.deinit();
-                    if (filter.search.len > 0) self.context.allocator.free(filter.search);
-                }
-                subscriber.filters.deinit();
-                _ = self.context.subscribers.orderedRemove(i);
+                var s = self.context.subscribers.orderedRemove(i);
+                s.deinit();
             }
         }
         try self.conn.writeFrame(websocket.OpCode.close, &[_]u8{ 3, 232 });
