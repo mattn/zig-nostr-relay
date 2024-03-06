@@ -248,7 +248,9 @@ const Handler = struct {
 
         for (tag) |id| {
             try params.append(.{ .string = id });
-            try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+            const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
+            try parambuf.appendSlice(s);
+            self.context.allocator.free(s);
             try parambuf.append(',');
         }
         if (parambuf.items.len == 0) return false;
@@ -311,7 +313,9 @@ const Handler = struct {
         try params.append(.{ .string = pubkey });
         for (tag) |id| {
             try params.append(.{ .string = id });
-            try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+            const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
+            try parambuf.appendSlice(s);
+            self.context.allocator.free(s);
             try parambuf.append(',');
         }
         if (parambuf.items.len == 0) return false;
@@ -580,12 +584,16 @@ const Handler = struct {
                 defer parambuf.deinit();
                 for (filter.ids.items) |id| {
                     try params.append(.{ .string = id });
-                    try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                    const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
+                    try parambuf.appendSlice(s);
+                    self.context.allocator.free(s);
                     try parambuf.append(',');
                 }
                 if (parambuf.items.len > 0) {
                     _ = parambuf.pop();
-                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "id in ({s})", .{parambuf.items}));
+                    const s = try std.fmt.allocPrint(self.context.allocator, "id in ({s})", .{parambuf.items});
+                    try condbuf.append(s);
+                    self.context.allocator.free(s);
                 }
             }
             if (filter.authors.items.len > 0) {
@@ -593,12 +601,16 @@ const Handler = struct {
                 defer parambuf.deinit();
                 for (filter.authors.items) |pubkey| {
                     try params.append(.{ .string = pubkey });
-                    try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                    const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
+                    try parambuf.appendSlice(s);
+                    self.context.allocator.free(s);
                     try parambuf.append(',');
                 }
                 if (parambuf.items.len > 0) {
                     _ = parambuf.pop();
-                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "pubkey in ({s})", .{parambuf.items}));
+                    const s = try std.fmt.allocPrint(self.context.allocator, "pubkey in ({s})", .{parambuf.items});
+                    try condbuf.append(s);
+                    self.context.allocator.free(s);
                 }
             }
             if (filter.kinds.items.len > 0) {
@@ -606,12 +618,16 @@ const Handler = struct {
                 defer parambuf.deinit();
                 for (filter.kinds.items) |kind| {
                     try params.append(.{ .number = kind });
-                    try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                    const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
+                    try parambuf.appendSlice(s);
+                    self.context.allocator.free(s);
                     try parambuf.append(',');
                 }
                 if (parambuf.items.len > 0) {
                     _ = parambuf.pop();
-                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "kind in ({s})", .{parambuf.items}));
+                    const s = try std.fmt.allocPrint(self.context.allocator, "kind in ({s})", .{parambuf.items});
+                    try condbuf.append(s);
+                    self.context.allocator.free(s);
                 }
             }
             if (filter.tags.items.len > 0) {
@@ -620,26 +636,36 @@ const Handler = struct {
                 for (filter.tags.items) |tag| {
                     for (tag) |v| {
                         try params.append(.{ .string = v });
-                        try parambuf.appendSlice(try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len}));
+                        const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
+                        try parambuf.appendSlice(s);
+                        self.context.allocator.free(s);
                         try parambuf.append(',');
                     }
                 }
                 if (parambuf.items.len > 0) {
                     _ = parambuf.pop();
-                    try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "tagvalues && ARRAY[{s}]", .{parambuf.items}));
+                    const s = try std.fmt.allocPrint(self.context.allocator, "tagvalues && ARRAY[{s}]", .{parambuf.items});
+                    try condbuf.append(s);
+                    self.context.allocator.free(s);
                 }
             }
             if (filter.since > 0) {
                 try params.append(.{ .number = filter.since });
-                try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "created_at >= ${}", .{params.items.len}));
+                const s = try std.fmt.allocPrint(self.context.allocator, "created_at >= ${}", .{params.items.len});
+                try condbuf.append(s);
+                self.context.allocator.free(s);
             }
             if (filter.until > 0) {
                 try params.append(.{ .number = filter.until });
-                try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "created_at <= ${}", .{params.items.len}));
+                const s = try std.fmt.allocPrint(self.context.allocator, "created_at <= ${}", .{params.items.len});
+                try condbuf.append(s);
+                self.context.allocator.free(s);
             }
             if (filter.search.len > 0) {
                 try params.append(.{ .string = try std.fmt.allocPrint(self.context.allocator, "%{s}%", .{filter.search}) });
-                try condbuf.append(try std.fmt.allocPrint(self.context.allocator, "content LIKE ${}", .{params.items.len}));
+                const s = try std.fmt.allocPrint(self.context.allocator, "content LIKE ${}", .{params.items.len});
+                try condbuf.append(s);
+                self.context.allocator.free(s);
             }
 
             if (filter.limit < limit) {
@@ -747,6 +773,7 @@ const Handler = struct {
                     filter.authors.deinit();
                     filter.kinds.deinit();
                     filter.tags.deinit();
+                    if (filter.search.len > 0) self.context.allocator.free(filter.search);
                 }
                 subscriber.filters.deinit();
                 _ = self.context.subscribers.orderedRemove(i);
