@@ -156,16 +156,11 @@ const Handler = struct {
 
     pub fn init(h: Handshake, conn: *Conn, context: *Context) !Handler {
         _ = h;
-        return Handler{
-            .conn = conn,
-            .context = context,
-        };
-    }
 
-    pub fn afterInit(self: *Handler) !void {
-        const conn = try self.context.pool.acquire();
-        defer self.context.pool.release(conn);
-        _ = try conn.exec(
+        const db = try context.pool.acquire();
+        defer context.pool.release(db);
+
+        _ = try db.exec(
             \\CREATE OR REPLACE FUNCTION tags_to_tagvalues(jsonb) RETURNS text[]
             \\    AS 'SELECT array_agg(t->>1) FROM (SELECT jsonb_array_elements($1) AS t)s WHERE length(t->>0) = 1;'
             \\    LANGUAGE SQL
@@ -191,6 +186,11 @@ const Handler = struct {
             \\CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC);
             \\CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);
         , .{});
+
+        return Handler{
+            .conn = conn,
+            .context = context,
+        };
     }
 
     fn kindInSlice(haystack: []i64, needle: i64) bool {
@@ -258,9 +258,9 @@ const Handler = struct {
         var sql = try std.fmt.allocPrint(self.context.allocator, "delete from event where id in ({s})", .{parambuf.items});
         defer self.context.allocator.free(sql);
 
-        const conn = try self.context.pool.acquire();
-        defer self.context.pool.release(conn);
-        var stmt = pg.Stmt.init(conn, .{});
+        const db = try self.context.pool.acquire();
+        defer self.context.pool.release(db);
+        var stmt = pg.Stmt.init(db, .{});
         defer stmt.deinit();
 
         _ = stmt.prepare(sql) catch |err| {
@@ -280,9 +280,9 @@ const Handler = struct {
     }
 
     fn delete_record_by_kind_and_pubkey(self: *Handler, kind: i64, pubkey: []u8) !bool {
-        const conn = try self.context.pool.acquire();
-        defer self.context.pool.release(conn);
-        var stmt = pg.Stmt.init(conn, .{});
+        const db = try self.context.pool.acquire();
+        defer self.context.pool.release(db);
+        var stmt = pg.Stmt.init(db, .{});
         defer stmt.deinit();
 
         _ = stmt.prepare("delete from event where kind = $1 and pubkey = $2") catch |err| {
@@ -321,9 +321,9 @@ const Handler = struct {
         var sql = try std.fmt.allocPrint(self.context.allocator, "delete from event where kind = $1 and pubkey = $2 and id in ({s})", .{parambuf.items});
         defer self.context.allocator.free(sql);
 
-        const conn = try self.context.pool.acquire();
-        defer self.context.pool.release(conn);
-        var stmt = pg.Stmt.init(conn, .{});
+        const db = try self.context.pool.acquire();
+        defer self.context.pool.release(db);
+        var stmt = pg.Stmt.init(db, .{});
         defer stmt.deinit();
 
         _ = stmt.prepare(sql) catch |err| {
@@ -469,7 +469,7 @@ const Handler = struct {
         return filters;
     }
 
-    pub fn handle(self: *Handler, message: Message) !void {
+    pub fn handleText(self: *Handler, message: Message) !void {
         const data = message.data;
         std.debug.print("{s}\n", .{data});
         const parsed = std.json.parseFromSlice(std.json.Value, self.context.allocator, data, .{}) catch |err| {
@@ -522,9 +522,9 @@ const Handler = struct {
                 }
 
                 const tagsj = try make_tagsj(self.context.allocator, ev);
-                const conn = try self.context.pool.acquire();
-                defer self.context.pool.release(conn);
-                _ = try conn.exec(
+                const db = try self.context.pool.acquire();
+                defer self.context.pool.release(db);
+                _ = try db.exec(
                     \\INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES ($1, $2, $3, $4, $5, $6, $7)
                 , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, @constCast(tagsj), ev.content, ev.sig });
             }
@@ -565,9 +565,6 @@ const Handler = struct {
                 .client = self,
                 .filters = filters,
             });
-
-            const conn = try self.context.pool.acquire();
-            defer self.context.pool.release(conn);
 
             const value = union(enum) {
                 number: i64,
@@ -663,7 +660,10 @@ const Handler = struct {
             }
             try writer.print(" order by created_at desc limit {}", .{limit});
 
-            var stmt = pg.Stmt.init(conn, .{});
+            const db = try self.context.pool.acquire();
+            defer self.context.pool.release(db);
+
+            var stmt = pg.Stmt.init(db, .{});
             defer stmt.deinit();
 
             _ = stmt.prepare(sqlbuf.items) catch |err| {
@@ -716,6 +716,35 @@ const Handler = struct {
             try self.conn.write(buf);
         }
     }
+
+    pub fn handleClose(self: *Handler, _: Message) !void {
+        for (self.context.subscribers.items, 0..) |subscriber, i| {
+            if (subscriber.client == self) {
+                self.context.allocator.free(subscriber.sub);
+                for (subscriber.filters.items) |filter| {
+                    filter.ids.deinit();
+                    filter.authors.deinit();
+                    filter.kinds.deinit();
+                    filter.tags.deinit();
+                }
+                subscriber.filters.deinit();
+                _ = self.context.subscribers.orderedRemove(i);
+            }
+        }
+        try self.conn.writeFrame(websocket.OpCode.close, &[_]u8{ 3, 232 });
+    }
+
+    pub fn handle(self: *Handler, message: Message) !void {
+        switch (message.type) {
+            .text => try self.handleText(message),
+            .binary => try self.conn.write("[\"NOTICE\", \"error: invalid request\"]"),
+            .ping => try self.conn.writeFrame(websocket.OpCode.pong, message.data),
+            .pong => {},
+            .close => try self.handleClose(message),
+        }
+    }
+
+    pub fn afterInit(_: *Handler) !void {}
 
     pub fn close(_: *Handler) void {}
 };
