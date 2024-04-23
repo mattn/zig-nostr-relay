@@ -158,12 +158,13 @@ pub fn main() !void {
     const env = try struct_env.fromEnv(allocator, Config);
     defer struct_env.free(allocator, env);
 
-    var bundle = std.crypto.Certificate.Bundle{};
-    defer bundle.deinit(allocator);
+    var bundle: ?std.crypto.Certificate.Bundle = .{};
     if (env.db_ca_bundle.len > 0) {
         var dir = try std.fs.cwd().openDir(std.fs.path.dirname(env.db_ca_bundle).?, .{});
         var file = std.fs.path.basename(env.db_ca_bundle);
-        try bundle.addCertsFromFilePath(allocator, dir, file);
+        try bundle.?.addCertsFromFilePath(allocator, dir, file);
+    } else {
+        bundle = null;
     }
     var pool = pg.Pool.init(allocator, .{
         .size = 5,
@@ -181,6 +182,10 @@ pub fn main() !void {
         },
     }) catch return;
     defer pool.deinit();
+
+    if (env.db_ca_bundle.len > 0) {
+        bundle.?.deinit(allocator);
+    }
 
     var context = Context{
         .allocator = allocator,
