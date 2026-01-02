@@ -17,30 +17,26 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "zig-nostr-relay",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
-        .root_source_file = .{ .path = "src/main.zig" },
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "websocket", .module = b.dependency("websocket", .{
+                    .target = target,
+                    .optimize = optimize,
+                }).module("websocket") },
+                .{ .name = "pg", .module = b.dependency("pg", .{
+                    .target = target,
+                    .optimize = optimize,
+                }).module("pg") },
+                .{ .name = "struct-env", .module = b.dependency("struct_env", .{
+                    .target = target,
+                    .optimize = optimize,
+                }).module("struct-env") },
+            },
+        }),
     });
-
-    const websocket = b.dependency("websocket", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.addModule("websocket", websocket.module("websocket"));
-
-    const pg = b.dependency("pg", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.addModule("pg", pg.module("pg"));
-
-    const struct_env = b.dependency("struct_env", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.addModule("struct-env", struct_env.module("struct-env"));
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -73,9 +69,11 @@ pub fn build(b: *std.Build) void {
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const unit_tests = b.addTest(.{
-        .root_source_file = .{ .path = "src/main.zig" },
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);

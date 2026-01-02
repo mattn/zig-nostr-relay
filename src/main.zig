@@ -13,8 +13,8 @@ const struct_env = @import("struct-env");
 
 const Event = struct {
     id: []u8,
-    kind: i64 = 0,
-    created_at: i64,
+    kind: i32 = 0,
+    created_at: i32,
     pubkey: []u8,
     content: []u8,
     sig: []u8,
@@ -24,11 +24,11 @@ const Event = struct {
 const Filter = struct {
     ids: std.ArrayList([]const u8) = undefined,
     authors: std.ArrayList([]const u8) = undefined,
-    kinds: std.ArrayList(i64) = undefined,
+    kinds: std.ArrayList(i32) = undefined,
     tags: std.ArrayList([][]const u8) = undefined,
-    since: i64 = 0,
-    until: i64 = 0,
-    limit: i64 = 0,
+    since: i32 = 0,
+    until: i32 = 0,
+    limit: i32 = 0,
     search: []const u8 = undefined,
     allocator: std.mem.Allocator,
 
@@ -46,10 +46,10 @@ const Filter = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
-            .ids = std.ArrayList([]const u8).init(allocator),
-            .authors = std.ArrayList([]const u8).init(allocator),
-            .tags = std.ArrayList([][]const u8).init(allocator),
-            .kinds = std.ArrayList(i64).init(allocator),
+            .ids = .{ .items = &.{}, .capacity = 0 },
+            .authors = .{ .items = &.{}, .capacity = 0 },
+            .tags = .{ .items = &.{}, .capacity = 0 },
+            .kinds = .{ .items = &.{}, .capacity = 0 },
             .search = "",
             .since = 0,
             .until = 0,
@@ -58,11 +58,11 @@ const Filter = struct {
         };
     }
 
-    pub fn deinit(self: Self) void {
-        self.ids.deinit();
-        self.authors.deinit();
-        self.kinds.deinit();
-        self.tags.deinit();
+    pub fn deinit(self: *Self) void {
+        self.ids.deinit(self.allocator);
+        self.authors.deinit(self.allocator);
+        self.kinds.deinit(self.allocator);
+        self.tags.deinit(self.allocator);
         if (self.search.len > 0) self.allocator.free(self.search);
     }
 };
@@ -85,10 +85,10 @@ const Subscriber = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.filters.items) |filter| {
+        for (self.filters.items) |*filter| {
             filter.deinit();
         }
-        self.filters.deinit();
+        self.filters.deinit(self.allocator);
         if (self.sub.len > 0) self.allocator.free(self.sub);
     }
 };
@@ -100,14 +100,14 @@ const Context = struct {
 };
 
 const Config = struct {
-    db_host: []const u8 = "localhost",
-    db_port: u16 = 5432,
-    db_database: []const u8 = "zig-nostr-relay",
-    db_username: []const u8 = "postgres",
-    db_password: []const u8 = "postgres",
-    db_use_tls: bool = false,
-    db_ca_bundle: []const u8 = undefined,
-    db_timeout: u32 = 10_000,
+    //db_host: []const u8 = "localhost",
+    //db_port: u16 = 5432,
+    //db_database: []const u8 = "zig-nostr-relay",
+    //db_username: []const u8 = "postgres",
+    //db_password: []const u8 = "postgres",
+    //db_use_tls: bool = false,
+    //db_timeout: u32 = 10_000,
+    database_url: []const u8 = "",
     relay_addr: []const u8 = "0.0.0.0",
     relay_port: u16 = 7447,
 };
@@ -126,23 +126,23 @@ fn taggedHash(tag: []const u8, msg: []const u8) [32]u8 {
 }
 
 fn verify(public_key: [32]u8, msg: [32]u8, signature: [64]u8) !bool {
-    const Px = try Secp256k1.Fe.fromBytes(public_key, .Big);
+    const Px = try Secp256k1.Fe.fromBytes(public_key, .big);
     const Py = try Secp256k1.recoverY(Px, false);
     const P = try Secp256k1.fromAffineCoordinates(.{ .x = Px, .y = Py });
-    const r = try Secp256k1.Fe.fromBytes(signature[0..32].*, .Big);
-    const s = try Secp256k1.scalar.Scalar.fromBytes(signature[32..64].*, .Big);
+    const r = try Secp256k1.Fe.fromBytes(signature[0..32].*, .big);
+    const s = try Secp256k1.scalar.Scalar.fromBytes(signature[32..64].*, .big);
     var to_hash: [96]u8 = undefined;
     @memcpy(to_hash[0..32], signature[0..32]);
     @memcpy(to_hash[32..64], public_key[0..]);
     @memcpy(to_hash[64..96], msg[0..]);
     const e = try Scalar.fromBytes(
         taggedHash("BIP0340/challenge", to_hash[0..]),
-        .Big,
+        .big,
     );
     const R = (try Secp256k1.basePoint.mulPublic(
-        s.toBytes(.Big),
-        .Big,
-    )).sub(try P.mul(e.toBytes(.Big), .Big));
+        s.toBytes(.big),
+        .big,
+    )).sub(try P.mul(e.toBytes(.big), .big));
     if (R.affineCoordinates().y.isOdd()) {
         return false;
     }
@@ -158,53 +158,39 @@ pub fn main() !void {
     const env = try struct_env.fromEnv(allocator, Config);
     defer struct_env.free(allocator, env);
 
-    var bundle: ?std.crypto.Certificate.Bundle = .{};
-    if (env.db_ca_bundle.len > 0) {
-        var dir = try std.fs.cwd().openDir(std.fs.path.dirname(env.db_ca_bundle).?, .{});
-        var file = std.fs.path.basename(env.db_ca_bundle);
-        try bundle.?.addCertsFromFilePath(allocator, dir, file);
-    } else {
-        bundle = null;
-    }
-    var pool = pg.Pool.init(allocator, .{
+    var pool = pg.Pool.initUri(allocator, try std.Uri.parse(env.database_url), .{
         .size = 5,
-        .connect = .{
-            .port = env.db_port,
-            .host = env.db_host,
-            .tls = env.db_use_tls,
-            .ca_bundle = bundle,
-        },
-        .auth = .{
-            .database = env.db_database,
-            .username = env.db_username,
-            .password = env.db_password,
-            .timeout = env.db_timeout,
-        },
+        //.connect = .{
+        //    .port = env.db_port,
+        //    .host = env.db_host,
+        //    .tls = if (env.db_use_tls) .require else .off,
+        //},
     }) catch return;
     defer pool.deinit();
 
-    if (env.db_ca_bundle.len > 0) {
-        bundle.?.deinit(allocator);
-    }
-
+    const subscribers = std.ArrayList(Subscriber){};
     var context = Context{
         .allocator = allocator,
-        .subscribers = std.ArrayList(Subscriber).init(allocator),
+        .subscribers = subscribers,
         .pool = pool,
     };
 
-    try websocket.listen(Handler, allocator, &context, .{
+    var server = try websocket.server.Server(Handler).init(allocator, .{
         .port = env.relay_port,
-        .max_headers = 10,
         .address = env.relay_addr,
+        .handshake = .{
+            .max_headers = 10,
+        },
     });
+    defer server.deinit();
+    try server.listen(&context);
 }
 
 const Handler = struct {
     conn: *Conn,
     context: *Context,
 
-    pub fn init(h: Handshake, conn: *Conn, context: *Context) !Handler {
+    pub fn init(h: *Handshake, conn: *Conn, context: *Context) !Handler {
         _ = h;
 
         const db = try context.pool.acquire();
@@ -243,7 +229,7 @@ const Handler = struct {
         };
     }
 
-    fn kindInSlice(haystack: []i64, needle: i64) bool {
+    fn kindInSlice(haystack: []i32, needle: i32) bool {
         for (haystack) |item| {
             if (item == needle) {
                 return true;
@@ -291,31 +277,31 @@ const Handler = struct {
             number: i64,
             string: []const u8,
         };
-        var params = std.ArrayList(bindValue).init(self.context.allocator);
-        defer params.deinit();
-        var parambuf = std.ArrayList(u8).init(self.context.allocator);
-        defer parambuf.deinit();
+        var params: std.ArrayList(bindValue) = .{};
+        defer params.deinit(self.context.allocator);
+        var parambuf: std.ArrayList(u8) = .{};
+        defer parambuf.deinit(self.context.allocator);
 
         for (tag) |id| {
-            try params.append(.{ .string = id });
+            try params.append(self.context.allocator, .{ .string = id });
             const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
-            try parambuf.appendSlice(s);
+            try parambuf.appendSlice(self.context.allocator, s);
             self.context.allocator.free(s);
-            try parambuf.append(',');
+            try parambuf.append(self.context.allocator, ',');
         }
         if (parambuf.items.len == 0) return false;
 
         _ = parambuf.pop();
 
-        var sql = try std.fmt.allocPrint(self.context.allocator, "DELETE FROM event WHERE id IN ({s})", .{parambuf.items});
+        const sql = try std.fmt.allocPrint(self.context.allocator, "DELETE FROM event WHERE id IN ({s})", .{parambuf.items});
         defer self.context.allocator.free(sql);
 
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
-        var stmt = pg.Stmt.init(db, .{});
+        var stmt = try pg.Stmt.init(db, .{});
         defer stmt.deinit();
 
-        _ = stmt.prepare(sql) catch |err| {
+        _ = stmt.prepare(sql, null) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             return false;
         };
@@ -334,10 +320,10 @@ const Handler = struct {
     fn delete_record_by_kind_and_pubkey(self: *Handler, kind: i64, pubkey: []u8) !bool {
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
-        var stmt = pg.Stmt.init(db, .{});
+        var stmt = try pg.Stmt.init(db, .{});
         defer stmt.deinit();
 
-        _ = stmt.prepare("DELETE FROM event WHERE kind = $1 AND pubkey = $2") catch |err| {
+        _ = stmt.prepare("DELETE FROM event WHERE kind = $1 AND pubkey = $2", null) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             return false;
         };
@@ -355,32 +341,32 @@ const Handler = struct {
             number: i64,
             string: []const u8,
         };
-        var params = std.ArrayList(bindValue).init(self.context.allocator);
-        defer params.deinit();
-        var parambuf = std.ArrayList(u8).init(self.context.allocator);
-        defer parambuf.deinit();
-        try params.append(.{ .number = kind });
-        try params.append(.{ .string = pubkey });
+        var params: std.ArrayList(bindValue) = .{};
+        defer params.deinit(self.context.allocator);
+        var parambuf: std.ArrayList(u8) = .{};
+        defer parambuf.deinit(self.context.allocator);
+        try params.append(self.context.allocator, .{ .number = kind });
+        try params.append(self.context.allocator, .{ .string = pubkey });
         for (tag) |id| {
-            try params.append(.{ .string = id });
+            try params.append(self.context.allocator, .{ .string = id });
             const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
-            try parambuf.appendSlice(s);
+            try parambuf.appendSlice(self.context.allocator, s);
             self.context.allocator.free(s);
-            try parambuf.append(',');
+            try parambuf.append(self.context.allocator, ',');
         }
         if (parambuf.items.len == 0) return false;
 
         _ = parambuf.pop();
 
-        var sql = try std.fmt.allocPrint(self.context.allocator, "DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND id IN ({s})", .{parambuf.items});
+        const sql = try std.fmt.allocPrint(self.context.allocator, "DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND id IN ({s})", .{parambuf.items});
         defer self.context.allocator.free(sql);
 
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
-        var stmt = pg.Stmt.init(db, .{});
+        var stmt = try pg.Stmt.init(db, .{});
         defer stmt.deinit();
 
-        _ = stmt.prepare(sql) catch |err| {
+        _ = stmt.prepare(sql, null) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             return false;
         };
@@ -406,7 +392,10 @@ const Handler = struct {
             }
             try tags.append(std.json.Value{ .array = tmptag });
         }
-        return try std.json.stringifyAlloc(allocator, tags.items, .{});
+        var json_buf: std.ArrayList(u8) = .{};
+        defer json_buf.deinit(allocator);
+        try json_buf.writer(allocator).print("{f}", .{std.json.fmt(tags.items, .{})});
+        return try allocator.dupe(u8, json_buf.items);
     }
 
     fn verify_event(allocator: std.mem.Allocator, ev: Event) !bool {
@@ -433,12 +422,13 @@ const Handler = struct {
         var bytes_sig: [64]u8 = undefined;
         _ = try std.fmt.hexToBytes(&bytes_sig, ev.sig);
 
-        const buf = try std.json.stringifyAlloc(allocator, result, .{});
-        defer allocator.free(buf);
+        var json_buf: std.ArrayList(u8) = .{};
+        defer json_buf.deinit(allocator);
+        try json_buf.writer(allocator).print("{f}", .{std.json.fmt(result, .{})});
 
         var msgbuf: [32]u8 = undefined;
         var sha256 = Sha256.init(.{});
-        sha256.update(buf);
+        sha256.update(json_buf.items);
         sha256.final(&msgbuf);
 
         return try verify(
@@ -449,7 +439,7 @@ const Handler = struct {
     }
 
     fn make_filter(allocator: std.mem.Allocator, array: std.json.Array) !std.ArrayList(Filter) {
-        var filters = std.ArrayList(Filter).init(allocator);
+        var filters: std.ArrayList(Filter) = .{};
         for (array.items[2..]) |elem| {
             var filter = Filter.init(allocator);
             for (elem.object.keys()) |key| {
@@ -458,50 +448,50 @@ const Handler = struct {
                     if (ids.? != .array) continue;
                     for (ids.?.array.items) |id| {
                         if (id != .string) continue;
-                        try filter.ids.append(id.string);
+                        try filter.ids.append(allocator, id.string);
                     }
                 } else if (std.mem.eql(u8, key, "authors")) {
                     const authors = elem.object.get(key);
                     if (authors.? != .array) continue;
                     for (authors.?.array.items) |pubkey| {
                         if (pubkey != .string) continue;
-                        try filter.authors.append(pubkey.string);
+                        try filter.authors.append(allocator, pubkey.string);
                     }
                 } else if (std.mem.eql(u8, key, "tags")) {
                     const tags = elem.object.get(key);
                     if (tags.? != .array) continue;
                     for (tags.?.array.items) |tag| {
                         if (tag != .array) continue;
-                        var newarr = std.ArrayList([]const u8).init(allocator);
+                        var newarr: std.ArrayList([]const u8) = .{};
                         for (tag.array.items) |v| {
-                            try newarr.append(v.string);
+                            try newarr.append(allocator, v.string);
                         }
-                        try filter.tags.append(newarr.items);
+                        try filter.tags.append(allocator, newarr.items);
                     }
                 } else if (std.mem.startsWith(u8, key, "#")) {
                     const tag = elem.object.get(key);
                     if (tag.? != .array) continue;
-                    var newarr = std.ArrayList([]const u8).init(allocator);
-                    try newarr.append(key[1..]);
+                    var newarr: std.ArrayList([]const u8) = .{};
+                    try newarr.append(allocator, key[1..]);
                     for (tag.?.array.items) |v| {
-                        try newarr.append(v.string);
+                        try newarr.append(allocator, v.string);
                     }
-                    try filter.tags.append(newarr.items);
+                    try filter.tags.append(allocator, newarr.items);
                 } else if (std.mem.eql(u8, key, "kinds")) {
                     const kinds = elem.object.get(key);
                     if (kinds.? != .array) continue;
                     for (kinds.?.array.items) |kind| {
                         if (kind != .integer) continue;
-                        try filter.kinds.append(kind.integer);
+                        try filter.kinds.append(allocator, @intCast(kind.integer));
                     }
                 } else if (std.mem.eql(u8, key, "since")) {
                     const since = elem.object.get(key);
                     if (since.? != .integer) continue;
-                    filter.since = since.?.integer;
+                    filter.since = @intCast(since.?.integer);
                 } else if (std.mem.eql(u8, key, "until")) {
                     const until = elem.object.get(key);
                     if (until.? != .integer) continue;
-                    filter.until = until.?.integer;
+                    filter.until = @intCast(until.?.integer);
                 } else if (std.mem.eql(u8, key, "search")) {
                     const search = elem.object.get(key);
                     if (search.? != .string) continue;
@@ -509,11 +499,11 @@ const Handler = struct {
                 } else if (std.mem.eql(u8, key, "limit")) {
                     const limit = elem.object.get(key);
                     if (limit.? != .integer) continue;
-                    filter.limit = limit.?.integer;
+                    filter.limit = @intCast(limit.?.integer);
                 }
             }
 
-            try filters.append(filter);
+            try filters.append(allocator, filter);
         }
         return filters;
     }
@@ -571,15 +561,10 @@ const Handler = struct {
         for (self.context.subscribers.items) |subscriber| {
             if (!eventMatched(ev, subscriber.filters)) continue;
 
-            var buf = std.ArrayList(u8).init(self.context.allocator);
-            defer buf.deinit();
-            var jw = std.json.writeStream(buf.writer(), .{});
-            defer jw.deinit();
-            try jw.beginArray();
-            try jw.write("EVENT");
-            try jw.write(subscriber.sub);
-            try jw.write(ev);
-            try jw.endArray();
+            var buf: std.ArrayList(u8) = .{};
+            defer buf.deinit(self.context.allocator);
+            const event_array = .{ "EVENT", subscriber.sub, ev };
+            try buf.writer(self.context.allocator).print("{f}", .{std.json.fmt(event_array, .{})});
             try subscriber.conn.write(buf.items);
         }
 
@@ -589,9 +574,10 @@ const Handler = struct {
             .{ .bool = true },
             .{ .string = "" },
         };
-        const buf = try std.json.stringifyAlloc(self.context.allocator, result, .{});
-        defer self.context.allocator.free(buf);
-        try self.conn.write(buf);
+        var json_buf: std.ArrayList(u8) = .{};
+        defer json_buf.deinit(self.context.allocator);
+        try json_buf.writer(self.context.allocator).print("{f}", .{std.json.fmt(result, .{})});
+        try self.conn.write(json_buf.items);
     }
 
     pub fn handleReq(self: *Handler, value: std.json.Value) !void {
@@ -599,102 +585,102 @@ const Handler = struct {
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         }
-        var sub = value.array.items[1].string;
+        const sub = value.array.items[1].string;
 
         const filters = try make_filter(self.context.allocator, value.array);
         const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters);
-        try self.context.subscribers.append(subscriber);
+        try self.context.subscribers.append(self.context.allocator, subscriber);
 
         const bindValue = union(enum) {
             number: i64,
             string: []const u8,
         };
-        var params = std.ArrayList(bindValue).init(self.context.allocator);
-        defer params.deinit();
+        var params: std.ArrayList(bindValue) = .{};
+        defer params.deinit(self.context.allocator);
 
-        var condbuf = std.ArrayList([]u8).init(self.context.allocator);
-        defer condbuf.deinit();
+        var condbuf: std.ArrayList([]u8) = .{};
+        defer condbuf.deinit(self.context.allocator);
 
         var limit: i64 = 500;
         for (filters.items) |filter| {
             if (filter.empty()) continue;
             if (filter.ids.items.len > 0) {
-                var parambuf = std.ArrayList(u8).init(self.context.allocator);
-                defer parambuf.deinit();
+                var parambuf: std.ArrayList(u8) = .{};
+                defer parambuf.deinit(self.context.allocator);
                 std.debug.print("{}\n", .{filter.ids.items.len});
                 for (filter.ids.items) |id| {
-                    try params.append(.{ .string = id });
+                    try params.append(self.context.allocator, .{ .string = id });
                     const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
-                    try parambuf.appendSlice(s);
-                    try parambuf.append(',');
+                    try parambuf.appendSlice(self.context.allocator, s);
+                    try parambuf.append(self.context.allocator, ',');
                 }
                 if (parambuf.items.len > 0) {
                     _ = parambuf.pop();
                     const s = try std.fmt.allocPrint(self.context.allocator, "id IN ({s})", .{parambuf.items});
-                    try condbuf.append(s);
+                    try condbuf.append(self.context.allocator, s);
                 }
             }
             if (filter.authors.items.len > 0) {
-                var parambuf = std.ArrayList(u8).init(self.context.allocator);
-                defer parambuf.deinit();
+                var parambuf: std.ArrayList(u8) = .{};
+                defer parambuf.deinit(self.context.allocator);
                 for (filter.authors.items) |pubkey| {
-                    try params.append(.{ .string = pubkey });
+                    try params.append(self.context.allocator, .{ .string = pubkey });
                     const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
-                    try parambuf.appendSlice(s);
-                    try parambuf.append(',');
+                    try parambuf.appendSlice(self.context.allocator, s);
+                    try parambuf.append(self.context.allocator, ',');
                 }
                 if (parambuf.items.len > 0) {
                     _ = parambuf.pop();
                     const s = try std.fmt.allocPrint(self.context.allocator, "pubkey IN ({s})", .{parambuf.items});
-                    try condbuf.append(s);
+                    try condbuf.append(self.context.allocator, s);
                 }
             }
             if (filter.kinds.items.len > 0) {
-                var parambuf = std.ArrayList(u8).init(self.context.allocator);
-                defer parambuf.deinit();
+                var parambuf: std.ArrayList(u8) = .{};
+                defer parambuf.deinit(self.context.allocator);
                 for (filter.kinds.items) |kind| {
-                    try params.append(.{ .number = kind });
+                    try params.append(self.context.allocator, .{ .number = kind });
                     const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
-                    try parambuf.appendSlice(s);
-                    try parambuf.append(',');
+                    try parambuf.appendSlice(self.context.allocator, s);
+                    try parambuf.append(self.context.allocator, ',');
                 }
                 if (parambuf.items.len > 0) {
                     _ = parambuf.pop();
                     const s = try std.fmt.allocPrint(self.context.allocator, "kind IN ({s})", .{parambuf.items});
-                    try condbuf.append(s);
+                    try condbuf.append(self.context.allocator, s);
                 }
             }
             if (filter.tags.items.len > 0) {
-                var parambuf = std.ArrayList(u8).init(self.context.allocator);
-                defer parambuf.deinit();
+                var parambuf: std.ArrayList(u8) = .{};
+                defer parambuf.deinit(self.context.allocator);
                 for (filter.tags.items) |tag| {
                     for (tag) |v| {
-                        try params.append(.{ .string = v });
+                        try params.append(self.context.allocator, .{ .string = v });
                         const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
-                        try parambuf.appendSlice(s);
-                        try parambuf.append(',');
+                        try parambuf.appendSlice(self.context.allocator, s);
+                        try parambuf.append(self.context.allocator, ',');
                     }
                 }
                 if (parambuf.items.len > 0) {
                     _ = parambuf.pop();
                     const s = try std.fmt.allocPrint(self.context.allocator, "tagvalues && ARRAY[{s}]", .{parambuf.items});
-                    try condbuf.append(s);
+                    try condbuf.append(self.context.allocator, s);
                 }
             }
             if (filter.since > 0) {
-                try params.append(.{ .number = filter.since });
+                try params.append(self.context.allocator, .{ .number = filter.since });
                 const s = try std.fmt.allocPrint(self.context.allocator, "created_at >= ${}", .{params.items.len});
-                try condbuf.append(s);
+                try condbuf.append(self.context.allocator, s);
             }
             if (filter.until > 0) {
-                try params.append(.{ .number = filter.until });
+                try params.append(self.context.allocator, .{ .number = filter.until });
                 const s = try std.fmt.allocPrint(self.context.allocator, "created_at <= ${}", .{params.items.len});
-                try condbuf.append(s);
+                try condbuf.append(self.context.allocator, s);
             }
             if (filter.search.len > 0) {
-                try params.append(.{ .string = try std.fmt.allocPrint(self.context.allocator, "%{s}%", .{filter.search}) });
+                try params.append(self.context.allocator, .{ .string = try std.fmt.allocPrint(self.context.allocator, "%{s}%", .{filter.search}) });
                 const s = try std.fmt.allocPrint(self.context.allocator, "content LIKE ${}", .{params.items.len});
-                try condbuf.append(s);
+                try condbuf.append(self.context.allocator, s);
             }
 
             if (filter.limit < limit) {
@@ -702,9 +688,9 @@ const Handler = struct {
             }
         }
 
-        var sqlbuf = std.ArrayList(u8).init(self.context.allocator);
-        defer sqlbuf.deinit();
-        const writer = sqlbuf.writer();
+        var sqlbuf: std.ArrayList(u8) = .{};
+        defer sqlbuf.deinit(self.context.allocator);
+        const writer = sqlbuf.writer(self.context.allocator);
 
         try writer.print("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event", .{});
         if (condbuf.items.len > 0) {
@@ -720,11 +706,11 @@ const Handler = struct {
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
 
-        var stmt = pg.Stmt.init(db, .{});
+        var stmt = try pg.Stmt.init(db, .{});
         defer stmt.deinit();
 
         std.debug.print("{s}\n", .{sqlbuf.items});
-        _ = stmt.prepare(sqlbuf.items) catch |err| {
+        _ = stmt.prepare(sqlbuf.items, null) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             return;
         };
@@ -744,7 +730,7 @@ const Handler = struct {
             ev.pubkey = row.get([]u8, 1);
             ev.created_at = row.get(i32, 2);
             ev.kind = row.get(i32, 3);
-            var tagsj = row.get([]u8, 4);
+            const tagsj = row.get([]u8, 4);
             const tags = try std.json.parseFromSliceLeaky([][][]u8, self.context.allocator, tagsj, .{});
             defer self.context.allocator.free(tags);
             ev.tags = tags;
@@ -753,15 +739,10 @@ const Handler = struct {
 
             if (!eventMatched(ev, filters)) continue;
 
-            var buf = std.ArrayList(u8).init(self.context.allocator);
-            defer buf.deinit();
-            var jw = std.json.writeStream(buf.writer(), .{});
-            defer jw.deinit();
-            try jw.beginArray();
-            try jw.write("EVENT");
-            try jw.write(sub);
-            try jw.write(ev);
-            try jw.endArray();
+            var buf: std.ArrayList(u8) = .{};
+            defer buf.deinit(self.context.allocator);
+            const event_array = .{ "EVENT", sub, ev };
+            try buf.writer(self.context.allocator).print("{f}", .{std.json.fmt(event_array, .{})});
             try self.conn.write(buf.items);
         }
 
@@ -771,13 +752,14 @@ const Handler = struct {
             .{ .bool = true },
             .{ .string = "" },
         };
-        const buf = try std.json.stringifyAlloc(self.context.allocator, result, .{});
-        defer self.context.allocator.free(buf);
-        try self.conn.write(buf);
+        var json_buf: std.ArrayList(u8) = .{};
+        defer json_buf.deinit(self.context.allocator);
+        try json_buf.writer(self.context.allocator).print("{f}", .{std.json.fmt(result, .{})});
+        try self.conn.write(json_buf.items);
     }
 
-    pub fn handleText(self: *Handler, message: Message) !void {
-        const data = message.data;
+    pub fn clientMessage(self: *Handler, allocator: std.mem.Allocator, data: []const u8) !void {
+        _ = allocator;
         std.debug.print("{s}\n", .{data});
         const parsed = std.json.parseFromSlice(std.json.Value, self.context.allocator, data, .{}) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
@@ -796,33 +778,13 @@ const Handler = struct {
         }
     }
 
-    pub fn handleClose(self: *Handler) !void {
+    pub fn close(self: *Handler) void {
         for (self.context.subscribers.items, 0..) |subscriber, i| {
             if (subscriber.conn == self.conn) {
                 var s = self.context.subscribers.orderedRemove(i);
                 s.deinit();
             }
         }
-        try self.conn.writeFrame(websocket.OpCode.close, &[_]u8{ 3, 232 });
-    }
-
-    pub fn handlePing(self: *Handler, message: Message) !void {
-        try self.conn.writeFrame(websocket.OpCode.pong, message.data);
-    }
-
-    pub fn handle(self: *Handler, message: Message) !void {
-        switch (message.type) {
-            .text => try self.handleText(message),
-            .binary => try self.conn.write("[\"NOTICE\", \"error: invalid request\"]"),
-            .ping => try self.handlePing(message),
-            .pong => {},
-            .close => try self.handleClose(),
-        }
-    }
-
-    pub fn afterInit(_: *Handler) !void {}
-
-    pub fn close(self: *Handler) void {
-        self.handleClose() catch undefined;
+        self.conn.writeFrame(websocket.OpCode.close, &[_]u8{ 3, 232 }) catch {};
     }
 };
