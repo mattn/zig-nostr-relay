@@ -251,6 +251,12 @@ fn handleHTTPRequest(allocator: std.mem.Allocator, socket: std.posix.socket_t, r
         if (std.mem.eql(u8, path, "/")) {
             try serveStaticFile(allocator, socket, "public/index.html");
         } else if (std.mem.startsWith(u8, path, "/")) {
+            // Prevent directory traversal
+            if (std.mem.containsAtLeast(u8, path, 1, "..")) {
+                const not_found = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+                _ = std.posix.write(socket, not_found) catch {};
+                return;
+            }
             const file_path = try std.fmt.allocPrint(allocator, "public{s}", .{path});
             defer allocator.free(file_path);
             try serveStaticFile(allocator, socket, file_path);
