@@ -8,8 +8,12 @@ COPY . .
 RUN zig build -Doptimize=ReleaseSmall
 
 # Final stage
-FROM alpine:latest
-RUN apk add --no-cache openssl ca-certificates
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/zig-out/bin/zig-nostr-relay /app/zig-nostr-relay
 COPY public/ /app/public/
 WORKDIR /app
