@@ -10,94 +10,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const pg = @import("pg");
 const struct_env = @import("struct-env");
-
-const Event = struct {
-    id: []u8,
-    kind: i32 = 0,
-    created_at: i32,
-    pubkey: []u8,
-    content: []u8,
-    sig: []u8,
-    tags: [][][]u8,
-};
-
-const Filter = struct {
-    ids: std.ArrayList([]const u8) = undefined,
-    authors: std.ArrayList([]const u8) = undefined,
-    kinds: std.ArrayList(i32) = undefined,
-    tags: std.ArrayList([][]const u8) = undefined,
-    since: i32 = 0,
-    until: i32 = 0,
-    limit: i32 = 0,
-    search: []const u8 = undefined,
-    allocator: std.mem.Allocator,
-
-    pub fn empty(self: *const Filter) bool {
-        return self.ids.items.len == 0 and
-            self.authors.items.len == 0 and
-            self.kinds.items.len == 0 and
-            self.tags.items.len == 0 and
-            self.since == 0 and
-            self.until == 0 and
-            self.search.len == 0;
-    }
-
-    const Self = @This();
-
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return .{
-            .ids = .{ .items = &.{}, .capacity = 0 },
-            .authors = .{ .items = &.{}, .capacity = 0 },
-            .tags = .{ .items = &.{}, .capacity = 0 },
-            .kinds = .{ .items = &.{}, .capacity = 0 },
-            .search = "",
-            .since = 0,
-            .until = 0,
-            .limit = 500,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.ids.deinit(self.allocator);
-        self.authors.deinit(self.allocator);
-        self.kinds.deinit(self.allocator);
-        self.tags.deinit(self.allocator);
-        if (self.search.len > 0) self.allocator.free(self.search);
-    }
-};
-
-const Subscriber = struct {
-    sub: []const u8,
-    conn: *Conn,
-    filters: std.ArrayList(Filter),
-    allocator: std.mem.Allocator,
-
-    const Self = @This();
-
-    pub fn init(allocator: std.mem.Allocator, sub: []const u8, conn: *Conn, filters: std.ArrayList(Filter)) !Self {
-        return .{
-            .sub = try allocator.dupe(u8, sub),
-            .conn = conn,
-            .filters = filters,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        for (self.filters.items) |*filter| {
-            filter.deinit();
-        }
-        self.filters.deinit(self.allocator);
-        if (self.sub.len > 0) self.allocator.free(self.sub);
-    }
-};
-
-const Context = struct {
-    allocator: std.mem.Allocator,
-    subscribers: std.ArrayList(Subscriber),
-    pool: *pg.Pool,
-};
+const relay = @import("relay.zig");
 
 const Config = struct {
     database_url: []const u8 = "",
@@ -286,65 +199,26 @@ pub fn main() !void {
     defer pool.deinit();
     std.debug.print("Pool initialized\n", .{});
 
-    const context = Context{
+    // Initialize database schema
+    std.debug.print("Initializing database schema...\n", .{});
+    try relay.initDatabase(pool);
+    std.debug.print("Database initialized\n", .{});
+
+    // Create relay context
+    var context = relay.Context{
         .allocator = allocator,
-        .subscribers = std.ArrayList(Subscriber){},
+        .subscribers = std.ArrayList(relay.Subscriber){},
         .pool = pool,
     };
-    _ = context;
-
-    // TCPサーバーを起動
-    const server_address = try std.net.Address.parseIp(env.relay_addr, env.relay_port);
-    const server_socket = try std.posix.socket(server_address.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    defer std.posix.close(server_socket);
-
-    try std.posix.setsockopt(server_socket, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-
-    // Set socket timeout to allow signal handling
-    const one_sec: c_long = 1;
-    const zero_usec: c_long = 0;
-    var timeout: std.posix.timeval = .{ .sec = one_sec, .usec = zero_usec };
-    try std.posix.setsockopt(server_socket, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
-
-    const socklen = server_address.getOsSockLen();
-    try std.posix.bind(server_socket, &server_address.any, socklen);
-    try std.posix.listen(server_socket, 128);
 
     std.debug.print("Starting Nostr relay on {s}:{}\n", .{ env.relay_addr, env.relay_port });
-    std.debug.print("Server initialized, listening...\n", .{});
 
-    while (!shutdown_flag.load(.acquire)) {
-        var client_addr: std.net.Address = undefined;
-        var client_addr_len: std.posix.socklen_t = @sizeOf(std.net.Address);
-        const client_socket = std.posix.accept(server_socket, &client_addr.any, &client_addr_len, 0) catch |err| {
-            // EAGAIN/EWOULDBLOCK is expected due to timeout
-            if (err == error.WouldBlock) {
-                continue;
-            }
-            std.debug.print("Failed to accept connection: {}\n", .{err});
-            continue;
-        };
-        defer std.posix.close(client_socket);
+    // Start WebSocket server
+    var server = try websocket.Server(relay.Handler).init(allocator, .{
+        .address = env.relay_addr,
+        .port = env.relay_port,
+    });
+    defer server.deinit();
 
-        var buffer: [4096]u8 = undefined;
-        const bytes_read = std.posix.read(client_socket, &buffer) catch |err| {
-            std.debug.print("Failed to read from socket: {}\n", .{err});
-            continue;
-        };
-
-        if (bytes_read == 0) continue;
-
-        const request = buffer[0..bytes_read];
-
-        if (std.mem.startsWith(u8, request, "GET")) {
-            if (std.mem.containsAtLeast(u8, request, 1, "Upgrade: websocket") or
-                std.mem.containsAtLeast(u8, request, 1, "Sec-WebSocket-Key"))
-            {
-                continue;
-            }
-            try handleHTTPRequest(allocator, client_socket, request);
-        }
-    }
-
-    std.debug.print("\nShutdown signal received, exiting...\n", .{});
+    try server.listen(&context);
 }
