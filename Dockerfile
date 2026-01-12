@@ -8,10 +8,15 @@ COPY . .
 RUN zig build -Doptimize=ReleaseSmall
 
 # Final stage
-FROM scratch
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=builder /app/zig-out/bin/zig-nostr-relay /zig-nostr-relay
-COPY --from=builder /app/public/ /public/
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/zig-out/bin/zig-nostr-relay /app/zig-nostr-relay
+COPY --from=builder /app/public/ /app/public/
+WORKDIR /app
 
 EXPOSE 7447
 ENV DATABASE_URL="postgres://postgres:password@localhost:5432/nostr-relay"
