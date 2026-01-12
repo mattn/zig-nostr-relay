@@ -10,6 +10,7 @@ RUN zig build -Doptimize=ReleaseSmall
 # Final stage
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libc6 \
     ca-certificates \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
