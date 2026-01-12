@@ -214,6 +214,7 @@ fn handleHTTPRequest(allocator: std.mem.Allocator, socket: std.posix.socket_t, r
         try j.print("{{", .{});
         try j.print("\"name\":\"zig-nostr-relay\"", .{});
         try j.print(",\"description\":\"A high-performance Nostr relay written in Zig\"", .{});
+        try j.print(",\"logo\":\"https://zig-nostr-relay.compile-error.net/logo.png\"", .{});
         try j.print(",\"supported_nips\":[1,2,4,9,11,20,22,33,40,42]", .{});
         try j.print(",\"software\":\"https://github.com/mattn/zig-nostr-relay\"", .{});
         try j.print(",\"version\":\"0.1.0\"", .{});
