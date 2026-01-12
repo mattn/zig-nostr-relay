@@ -15,6 +15,23 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    const pg_dep = b.dependency("pg", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    var pg_module = pg_dep.module("pg");
+
+    // Configure OpenSSL for pg module
+    const pg_options = b.addOptions();
+    pg_options.addOption(bool, "openssl", true);
+    pg_options.addOption(bool, "column_names", false);
+    pg_module.addOptions("config", pg_options);
+
+    pg_module.linkSystemLibrary("ssl", .{});
+    pg_module.linkSystemLibrary("crypto", .{});
+    pg_module.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    pg_module.link_libc = true;
+
     const exe = b.addExecutable(.{
         .name = "zig-nostr-relay",
         .root_module = b.createModule(.{
@@ -26,10 +43,7 @@ pub fn build(b: *std.Build) void {
                     .target = target,
                     .optimize = optimize,
                 }).module("websocket") },
-                .{ .name = "pg", .module = b.dependency("pg", .{
-                    .target = target,
-                    .optimize = optimize,
-                }).module("pg") },
+                .{ .name = "pg", .module = pg_module },
                 .{ .name = "struct-env", .module = b.dependency("struct_env", .{
                     .target = target,
                     .optimize = optimize,
@@ -37,6 +51,11 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    // Link OpenSSL libraries
+    exe.linkSystemLibrary("ssl");
+    exe.linkSystemLibrary("crypto");
+    exe.linkLibC();
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
