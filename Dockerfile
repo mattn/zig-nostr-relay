@@ -14,10 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/zig-out/bin/zig-nostr-relay /app/zig-nostr-relay
-COPY public/ /app/public/
 WORKDIR /app
+COPY --from=builder /app/zig-out/bin/zig-nostr-relay ./zig-nostr-relay
+COPY --from=builder /app/public/ ./public/
 
 EXPOSE 7447
 ENV DATABASE_URL="postgres://postgres:password@localhost:5432/nostr-relay"
-ENTRYPOINT ["/app/zig-nostr-relay"]
+ENTRYPOINT ["./zig-nostr-relay"]
