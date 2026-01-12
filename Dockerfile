@@ -9,6 +9,7 @@ RUN zig build -Doptimize=ReleaseSmall
 
 # Final stage
 FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /app/zig-out/bin/zig-nostr-relay /zig-nostr-relay
 COPY --from=builder /app/public/ /public/
 
