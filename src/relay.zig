@@ -1131,15 +1131,28 @@ pub const Handler = struct {
             return;
         };
         defer parsed.deinit();
+        
+        // Ensure the parsed value is an array
+        if (parsed.value != .array) {
+            try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
+            return;
+        }
+        
         if (parsed.value.array.items.len < 2) {
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         }
-        if (std.mem.eql(u8, parsed.value.array.items[0].string, "EVENT")) {
+        if (parsed.value.array.items[0] != .string) {
+            try self.conn.write("[\"NOTICE\", \"error: invalid message type\"]");
+            return;
+        }
+        
+        const msg_type = parsed.value.array.items[0].string;
+        if (std.mem.eql(u8, msg_type, "EVENT")) {
             try self.handleEvent(parsed.value);
-        } else if (std.mem.eql(u8, parsed.value.array.items[0].string, "REQ")) {
+        } else if (std.mem.eql(u8, msg_type, "REQ")) {
             try self.handleReq(parsed.value);
-        } else if (std.mem.eql(u8, parsed.value.array.items[0].string, "CLOSE")) {
+        } else if (std.mem.eql(u8, msg_type, "CLOSE")) {
             try self.handleCloseMsg(parsed.value);
         }
     }
