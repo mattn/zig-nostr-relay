@@ -217,6 +217,7 @@ pub fn main() !void {
     var server = try websocket.Server(relay.Handler).init(allocator, .{
         .address = env.relay_addr,
         .port = env.relay_port,
+        .max_message_size = 262144,
     });
     defer server.deinit();
 

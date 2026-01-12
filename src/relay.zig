@@ -752,6 +752,8 @@ pub const Handler = struct {
     fn make_filter(allocator: std.mem.Allocator, array: std.json.Array) !std.ArrayList(*Filter) {
         var filters = std.ArrayList(*Filter){};
         for (array.items[2..]) |elem| {
+            if (elem != .object) continue;
+
             var filter = try allocator.create(Filter);
             filter.* = Filter.init(allocator);
             errdefer allocator.destroy(filter);
