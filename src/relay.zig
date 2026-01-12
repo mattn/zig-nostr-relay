@@ -189,7 +189,7 @@ fn make_tagsj(allocator: std.mem.Allocator, ev: Event) ![]const u8 {
     var result: std.ArrayList(u8) = .{};
     errdefer result.deinit(allocator);
     var writer = result.writer(allocator);
-    
+
     try writer.writeAll("[");
     for (ev.tags, 0..) |tag, i| {
         if (i > 0) try writer.writeAll(",");
@@ -203,7 +203,7 @@ fn make_tagsj(allocator: std.mem.Allocator, ev: Event) ![]const u8 {
         try writer.writeAll("]");
     }
     try writer.writeAll("]");
-    
+
     return result.toOwnedSlice(allocator);
 }
 
@@ -304,15 +304,15 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
 
     for (value.array.items[2..]) |elem| {
         if (elem != .object) continue;
-        
+
         var filter = try allocator.create(Filter);
         filter.* = Filter.init(allocator);
-        
+
         var it = elem.object.iterator();
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             const val = entry.value_ptr.*;
-            
+
             if (std.mem.eql(u8, key, "ids")) {
                 if (val != .array) continue;
                 for (val.array.items) |id| {
@@ -354,7 +354,7 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
                 filter.search = val.string;
             }
         }
-        
+
         try filters.append(allocator, filter);
     }
 
@@ -362,7 +362,7 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
     const db = try context.pool.acquire();
     defer context.pool.release(db);
 
-    var sql : std.ArrayList(u8) = .{};
+    var sql: std.ArrayList(u8) = .{};
     defer sql.deinit(allocator);
     var params = std.ArrayList([]const u8){};
     defer params.deinit(allocator);
@@ -439,7 +439,7 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
     while (try res.next()) |row| {
         if (row.values.len != 7) continue;
 
-        var response : std.ArrayList(u8) = .{};
+        var response: std.ArrayList(u8) = .{};
         defer response.deinit(allocator);
 
         const id = row.get([]u8, 0);
@@ -465,10 +465,10 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
 
 pub fn handleCloseMessage(_: std.mem.Allocator, _: std.posix.socket_t, context: *Context, value: std.json.Value) !void {
     if (value.array.items.len < 2) return;
-    
+
     const sub_id = value.array.items[1];
     if (sub_id != .string) return;
-    
+
     // Remove subscriber from context.subscribers
     var i: usize = 0;
     while (i < context.subscribers.items.len) {
@@ -499,10 +499,10 @@ pub fn verifyEvent(allocator: std.mem.Allocator, ev: Event) !bool {
     _ = try std.fmt.hexToBytes(&bytes_sig, ev.sig);
 
     // Serialize event to JSON manually for signature verification
-    var buf : std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(allocator);
     const writer = buf.writer(allocator);
-    
+
     try writer.writeAll("[0,\"");
     try writer.writeAll(ev.pubkey);
     try writer.writeAll("\",");
@@ -510,7 +510,7 @@ pub fn verifyEvent(allocator: std.mem.Allocator, ev: Event) !bool {
     try writer.writeAll(",");
     try writer.print("{}", .{ev.kind});
     try writer.writeAll(",");
-    
+
     // Write tags array
     try writer.writeAll("[");
     for (ev.tags, 0..) |tag, i| {
@@ -525,7 +525,7 @@ pub fn verifyEvent(allocator: std.mem.Allocator, ev: Event) !bool {
         try writer.writeAll("]");
     }
     try writer.writeAll("]");
-    
+
     try writer.writeAll(",\"");
     try writer.writeAll(ev.content);
     try writer.writeAll("\"]");
@@ -608,7 +608,7 @@ pub const Handler = struct {
         };
         var params = std.ArrayList(bindValue){};
         defer params.deinit(self.context.allocator);
-        var parambuf : std.ArrayList(u8) = .{};
+        var parambuf: std.ArrayList(u8) = .{};
         defer parambuf.deinit(self.context.allocator);
 
         for (tag) |id| {
@@ -666,7 +666,7 @@ pub const Handler = struct {
         };
         var params = std.ArrayList(bindValue){};
         defer params.deinit(self.context.allocator);
-        var parambuf : std.ArrayList(u8) = .{};
+        var parambuf: std.ArrayList(u8) = .{};
         defer parambuf.deinit(self.context.allocator);
         try params.append(self.context.allocator, .{ .number = kind });
         try params.append(self.context.allocator, .{ .string = pubkey });
@@ -713,13 +713,13 @@ pub const Handler = struct {
         var buf: std.ArrayList(u8) = .{};
         defer buf.deinit(allocator);
         var writer = buf.writer(allocator);
-        
+
         try writer.writeAll("[0,\"");
         try writer.writeAll(ev.pubkey);
         try writer.writeAll("\",");
         try writer.print("{},", .{ev.created_at});
         try writer.print("{},", .{ev.kind});
-        
+
         // Write tags array
         try writer.writeAll("[");
         for (ev.tags, 0..) |tag, i| {
@@ -755,7 +755,7 @@ pub const Handler = struct {
             var filter = try allocator.create(Filter);
             filter.* = Filter.init(allocator);
             errdefer allocator.destroy(filter);
-            
+
             for (elem.object.keys()) |key| {
                 if (std.mem.eql(u8, key, "ids")) {
                     const ids = elem.object.get(key);
@@ -875,7 +875,7 @@ pub const Handler = struct {
         for (self.context.subscribers.items) |subscriber| {
             if (!eventMatched(ev, subscriber.filters)) continue;
 
-            var buf : std.ArrayList(u8) = .{};
+            var buf: std.ArrayList(u8) = .{};
             defer buf.deinit(self.context.allocator);
             var event_writer = buf.writer(self.context.allocator);
             try event_writer.writeAll("[\"EVENT\",\"");
@@ -900,7 +900,7 @@ pub const Handler = struct {
             try subscriber.conn.write(buf.items);
         }
 
-        var buf : std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .{};
         defer buf.deinit(self.context.allocator);
         var ok_writer = buf.writer(self.context.allocator);
         try ok_writer.writeAll("[\"OK\",\"");
@@ -927,10 +927,10 @@ pub const Handler = struct {
         var params = std.ArrayList(bindValue){};
         defer params.deinit(self.context.allocator);
 
-        var sqlbuf : std.ArrayList(u8) = .{};
+        var sqlbuf: std.ArrayList(u8) = .{};
         defer sqlbuf.deinit(self.context.allocator);
         const sql_writer = sqlbuf.writer(self.context.allocator);
-        
+
         try sql_writer.writeAll("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event");
 
         var has_where = false;
@@ -1034,7 +1034,7 @@ pub const Handler = struct {
                 limit = filter.limit;
             }
         }
-        
+
         try sql_writer.print(" ORDER BY created_at DESC LIMIT {}", .{limit});
 
         const db = try self.context.pool.acquire();
@@ -1054,7 +1054,7 @@ pub const Handler = struct {
 
         while (try res.next()) |row| {
             if (row.values.len != 7) break;
-            
+
             const id = row.get([]u8, 0);
             const pubkey = row.get([]u8, 1);
             const created_at = row.get(i32, 2);
@@ -1063,7 +1063,7 @@ pub const Handler = struct {
             const content = row.get([]u8, 5);
             const sig = row.get([]u8, 6);
 
-            var buf : std.ArrayList(u8) = .{};
+            var buf: std.ArrayList(u8) = .{};
             defer buf.deinit(self.context.allocator);
             var event_writer = buf.writer(self.context.allocator);
             try event_writer.writeAll("[\"EVENT\",\"");
@@ -1086,7 +1086,7 @@ pub const Handler = struct {
             try self.conn.write(buf.items);
         }
 
-        var buf : std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .{};
         defer buf.deinit(self.context.allocator);
         var eose_writer = buf.writer(self.context.allocator);
         try eose_writer.writeAll("[\"EOSE\",\"");
@@ -1100,18 +1100,19 @@ pub const Handler = struct {
             try self.conn.write("[\"NOTICE\", \"error: invalid CLOSE message\"]");
             return;
         }
-        
+
         const sub_id = value.array.items[1];
         if (sub_id != .string) {
             try self.conn.write("[\"NOTICE\", \"error: subscription ID must be a string\"]");
             return;
         }
-        
+
         // Remove subscriber from context.subscribers
         var i: usize = 0;
         while (i < self.context.subscribers.items.len) {
-            if (std.mem.eql(u8, self.context.subscribers.items[i].sub, sub_id.string) and 
-                self.context.subscribers.items[i].conn == self.conn) {
+            if (std.mem.eql(u8, self.context.subscribers.items[i].sub, sub_id.string) and
+                self.context.subscribers.items[i].conn == self.conn)
+            {
                 var sub = self.context.subscribers.orderedRemove(i);
                 sub.deinit();
                 std.debug.print("Subscription {s} closed\n", .{sub_id.string});
@@ -1131,13 +1132,13 @@ pub const Handler = struct {
             return;
         };
         defer parsed.deinit();
-        
+
         // Ensure the parsed value is an array
         if (parsed.value != .array) {
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         }
-        
+
         if (parsed.value.array.items.len < 2) {
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
@@ -1146,7 +1147,7 @@ pub const Handler = struct {
             try self.conn.write("[\"NOTICE\", \"error: invalid message type\"]");
             return;
         }
-        
+
         const msg_type = parsed.value.array.items[0].string;
         if (std.mem.eql(u8, msg_type, "EVENT")) {
             try self.handleEvent(parsed.value);
