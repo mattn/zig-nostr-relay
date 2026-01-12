@@ -20,4 +20,4 @@ WORKDIR /app
 
 EXPOSE 7447
 ENV DATABASE_URL="postgres://postgres:password@localhost:5432/nostr-relay"
-ENTRYPOINT ["/zig-nostr-relay"]
+ENTRYPOINT ["./zig-nostr-relay"]
