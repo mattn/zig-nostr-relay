@@ -1149,14 +1149,17 @@ pub const Handler = struct {
             return;
         }
 
-        const parsed = std.json.parseFromSlice(std.json.Value, self.context.allocator, data, .{
+        // Parse with arena allocator to isolate potential issues
+        var arena = std.heap.ArenaAllocator.init(self.context.allocator);
+        defer arena.deinit();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), data, .{
             .allocate = .alloc_if_needed,
         }) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         };
-        defer parsed.deinit();
 
         // Ensure the parsed value is an array
         if (parsed.value != .array) {
