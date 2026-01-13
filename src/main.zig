@@ -158,12 +158,14 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         if (!has_more) break;
     }
 
-    // Close the WebSocket connection properly
-    conn.close(.{}) catch |err| {
-        std.debug.print("Error closing WebSocket connection: {s}\n", .{@errorName(err)});
-    };
-    
+    // Close the handler first (removes subscriptions)
     @constCast(&handler).close();
+    
+    // Mark as closed and close socket directly without sending close frame
+    // (avoids panic when client has already disconnected)
+    if (@atomicRmw(bool, &conn._closed, .Xchg, true, .monotonic) == false) {
+        std.posix.close(stream.handle);
+    }
 }
 
 fn handleHttpRequest(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
