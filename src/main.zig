@@ -115,47 +115,48 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     var reader = websocket.proto.Reader.init(reader_buf, @constCast(&buffer_provider), null);
 
     while (true) {
+        // Fill buffer with new data
         reader.fill(stream) catch |err| {
             // Connection closed or error, exit gracefully
-            if (err == error.EndOfStream) break;
+            if (err == error.EndOfStream or err == error.Closed) break;
             // Ignore other fill errors (avoid std.debug.print in multi-threaded context)
             break;
         };
 
-        const read_result = reader.read() catch |err| {
-            // Connection closed or error, exit gracefully
-            if (err == error.EndOfStream) break;
-            // Ignore other read errors (avoid std.debug.print in multi-threaded context)
-            break;
-        };
-        if (read_result == null) break;
+        // Process all messages in the buffer
+        while (true) {
+            const read_result = reader.read() catch |err| {
+                // Connection closed or error, exit gracefully
+                if (err == error.EndOfStream) break;
+                // Ignore other read errors (avoid std.debug.print in multi-threaded context)
+                break;
+            } orelse break; // Need more data, go back to fill()
 
-        const has_more = read_result.?[0];
-        const message = read_result.?[1];
-        defer reader.done(message.type);
+            const has_more = read_result[0];
+            const message = read_result[1];
+            defer reader.done(message.type);
 
-        switch (message.type) {
-            .text, .binary => {
-                if (message.data.len > 0) {
-                    @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
-                        // If connection is broken, exit gracefully
-                        if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
-                        // Ignore other handler errors (avoid std.debug.print in multi-threaded context)
-                        break;
+            switch (message.type) {
+                .text, .binary => {
+                    if (message.data.len > 0) {
+                        @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
+                            // If connection is broken, exit gracefully
+                            if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
+                            // Ignore other handler errors (avoid std.debug.print in multi-threaded context)
+                        };
+                    }
+                },
+                .close => return, // Exit both loops
+                .ping => {
+                    conn.writePong(message.data) catch |err| {
+                        if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) return;
                     };
-                }
-            },
-            .close => break,
-            .ping => {
-                conn.writePong(message.data) catch |err| {
-                    if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
-                    break;
-                };
-            },
-            .pong => {},
-        }
+                },
+                .pong => {},
+            }
 
-        if (!has_more) break;
+            if (!has_more) break; // No more messages in buffer, go back to fill()
+        }
     }
 
     // Close the handler first (removes subscriptions)
