@@ -1128,7 +1128,16 @@ pub const Handler = struct {
     pub fn clientMessage(self: *Handler, allocator: std.mem.Allocator, data: []const u8) !void {
         _ = allocator;
         std.debug.print("{s}\n", .{data});
-        const parsed = std.json.parseFromSlice(std.json.Value, self.context.allocator, data, .{}) catch |err| {
+
+        // Validate data is not empty
+        if (data.len == 0) {
+            try self.conn.write("[\"NOTICE\", \"error: empty message\"]");
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.context.allocator, data, .{
+            .allocate = .alloc_if_needed,
+        }) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;

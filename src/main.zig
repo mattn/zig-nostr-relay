@@ -98,9 +98,15 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     var reader = websocket.proto.Reader.init(reader_buf, @constCast(&buffer_provider), null);
 
     while (true) {
-        reader.fill(stream) catch break;
+        reader.fill(stream) catch |err| {
+            std.debug.print("WebSocket fill error: {}\n", .{err});
+            break;
+        };
 
-        const read_result = reader.read() catch break;
+        const read_result = reader.read() catch |err| {
+            std.debug.print("WebSocket read error: {}\n", .{err});
+            break;
+        };
         if (read_result == null) break;
 
         const has_more = read_result.?[0];
@@ -109,10 +115,12 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
 
         switch (message.type) {
             .text, .binary => {
-                @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
-                    std.debug.print("Handler error: {}\n", .{err});
-                    break;
-                };
+                if (message.data.len > 0) {
+                    @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
+                        std.debug.print("Handler error: {}\n", .{err});
+                        break;
+                    };
+                }
             },
             .close => break,
             .ping => {
