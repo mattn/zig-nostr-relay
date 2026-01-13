@@ -148,6 +148,8 @@ fn handleHTTPRequest(allocator: std.mem.Allocator, socket: std.posix.socket_t, r
         try writer.print("HTTP/1.1 200 OK\r\n", .{});
         try writer.print("Connection: close\r\n", .{});
         try writer.print("Access-Control-Allow-Origin: *\r\n", .{});
+        try writer.print("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n", .{});
+        try writer.print("Access-Control-Allow-Headers: Accept, Content-Type\r\n", .{});
         try writer.print("Content-Type: application/nostr+json\r\n", .{});
         try writer.print("Content-Length: {}\r\n\r\n", .{json.items.len});
         try writer.writeAll(json.items);
