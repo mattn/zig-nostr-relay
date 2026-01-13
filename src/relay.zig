@@ -3,6 +3,7 @@ const websocket = @import("websocket");
 const Conn = websocket.Conn;
 const Message = websocket.Message;
 const Handshake = websocket.Handshake;
+const logger = @import("logger.zig");
 
 const Secp256k1 = std.crypto.ecc.Secp256k1;
 const Scalar = Secp256k1.scalar.Scalar;
@@ -213,13 +214,13 @@ pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket
     const ev = parsedEvent.value;
 
     const verified = verifyEvent(allocator, ev) catch |err| {
-        std.debug.print("error: {s}\n", .{@errorName(err)});
+        logger.warn("Event verification failed: {s}", .{@errorName(err)});
         const notice = "[\"NOTICE\",\"error: verification failed\"]";
         _ = std.posix.write(socket, notice) catch {};
         return;
     };
     if (!verified) {
-        std.debug.print("error: {s}\n", .{"invalid event signature"});
+        logger.warn("Event has invalid signature", .{});
         const notice = "[\"NOTICE\",\"error: invalid signature\"]";
         _ = std.posix.write(socket, notice) catch {};
         return;
@@ -234,7 +235,7 @@ pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket
         for (ev.tags) |tag| {
             if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) {
                 _ = db.exec("DELETE FROM event WHERE id = $1 AND pubkey = $2", .{ tag[1], ev.pubkey }) catch |err| {
-                    std.debug.print("error deleting event: {s}\n", .{@errorName(err)});
+                    logger.warn("Error deleting event: {s}", .{@errorName(err)});
                 };
             }
         }
@@ -243,7 +244,7 @@ pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket
         if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
             // Replaceable events: delete same kind and pubkey
             _ = db.exec("DELETE FROM event WHERE kind = $1 AND pubkey = $2", .{ ev.kind, ev.pubkey }) catch |err| {
-                std.debug.print("error deleting replaceable event: {s}\n", .{@errorName(err)});
+                logger.warn("Error deleting replaceable event: {s}", .{@errorName(err)});
             };
         } else if (30000 <= ev.kind and ev.kind < 40000) {
             // Parameterized replaceable events: delete by kind, pubkey, and d tag
@@ -252,7 +253,7 @@ pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket
                     const pattern = try std.fmt.allocPrint(allocator, "%\"d\",\"{s}\"%", .{tag[1]});
                     defer allocator.free(pattern);
                     _ = db.exec("DELETE FROM event WHERE kind = $1 AND pubkey = $2 AND tags::text LIKE $3", .{ ev.kind, ev.pubkey, pattern }) catch |err| {
-                        std.debug.print("error deleting parameterized event: {s}\n", .{@errorName(err)});
+                        logger.warn("Error deleting parameterized event: {s}", .{@errorName(err)});
                     };
                     break;
                 }
@@ -267,7 +268,7 @@ pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket
         _ = db.exec(
             \\INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES ($1, $2, $3, $4, $5, $6, $7)
         , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, tagsj, ev.content, ev.sig }) catch |err| {
-            std.debug.print("error inserting event: {s}\n", .{@errorName(err)});
+            logger.warn("Error inserting event: {s}", .{@errorName(err)});
             var response: [512]u8 = undefined;
             const response_len = try std.fmt.bufPrint(&response, "[\"OK\",\"{s}\",false,\"error: {s}\"]", .{ ev.id, @errorName(err) });
             _ = std.posix.write(socket, response_len) catch {};
@@ -476,7 +477,7 @@ pub fn handleCloseMessage(_: std.mem.Allocator, _: std.posix.socket_t, context: 
         if (std.mem.eql(u8, context.subscribers.items[i].sub, sub_id.string)) {
             var sub = context.subscribers.orderedRemove(i);
             sub.deinit();
-            std.debug.print("Subscription {s} closed\n", .{sub_id.string});
+            logger.debug("Subscription {s} closed", .{sub_id.string});
             return;
         }
         i += 1;
@@ -830,11 +831,11 @@ pub const Handler = struct {
         const ev = parsedEvent.value;
 
         const verified = verify_event(self.context.allocator, ev) catch |err| {
-            std.debug.print("error: {s}\n", .{@errorName(err)});
+            logger.warn("Event verification failed: {s}", .{@errorName(err)});
             return;
         };
         if (!verified) {
-            std.debug.print("error: {s}\n", .{"invalid event signature"});
+            logger.warn("Event has invalid signature", .{});
             return;
         }
 
@@ -871,7 +872,7 @@ pub const Handler = struct {
             _ = db.exec(
                 \\insert into event (id, pubkey, created_at, kind, tags, content, sig) values ($1, $2, $3, $4, $5, $6, $7)
             , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, @constCast(tagsj), ev.content, ev.sig }) catch |err| {
-                std.debug.print("error: {s}\n", .{@errorName(err)});
+                logger.warn("Error inserting event: {s}", .{@errorName(err)});
             };
         }
 
@@ -894,7 +895,6 @@ pub const Handler = struct {
         for (subscribers_to_notify.items) |subscriber| {
             // Double-check connection is still open
             if (subscriber.conn._closed) {
-                std.debug.print("Skipping closed connection for subscription {s}\n", .{subscriber.sub});
                 continue;
             }
 
@@ -920,8 +920,8 @@ pub const Handler = struct {
             defer self.context.allocator.free(tags);
             try event_writer.writeAll(tags);
             try event_writer.writeAll("}]");
-            subscriber.conn.write(buf.items) catch |err| {
-                std.debug.print("Failed to write to subscriber {s}: {s}\n", .{ subscriber.sub, @errorName(err) });
+            subscriber.conn.write(buf.items) catch {
+                // Silently ignore write errors (connection probably closed)
                 continue;
             };
         }
@@ -1148,22 +1148,18 @@ pub const Handler = struct {
             {
                 var sub = self.context.subscribers.orderedRemove(i);
                 sub.deinit();
-                std.debug.print("Subscription {s} closed\n", .{sub_id.string});
                 return;
             }
             i += 1;
         }
-        std.debug.print("Subscription {s} not found\n", .{sub_id.string});
     }
 
     pub fn clientMessage(self: *Handler, allocator: std.mem.Allocator, data: []const u8) !void {
         _ = allocator;
-        std.debug.print("{s}\n", .{data});
 
         // Validate data is not empty
         if (data.len == 0) {
             self.conn.write("[\"NOTICE\", \"error: empty message\"]") catch |err| {
-                std.debug.print("Write error (empty): {s}\n", .{@errorName(err)});
                 return err;
             };
             return;
@@ -1171,19 +1167,12 @@ pub const Handler = struct {
 
         // Validate JSON structure - must start with [ and end with ]
         if (data[0] != '[' or data[data.len - 1] != ']') {
-            std.debug.print("error: incomplete or malformed JSON structure (len={d}): ", .{data.len});
-            if (data.len < 100) {
-                std.debug.print("{s}\n", .{data});
-            } else {
-                std.debug.print("{s}...{s}\n", .{ data[0..50], data[data.len - 50 ..] });
-            }
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         }
 
         // Validate UTF-8
         if (!std.unicode.utf8ValidateSlice(data)) {
-            std.debug.print("error: invalid UTF-8 in message\n", .{});
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         }
@@ -1192,26 +1181,17 @@ pub const Handler = struct {
         var arena = std.heap.ArenaAllocator.init(self.context.allocator);
         defer arena.deinit();
 
-        std.debug.print("Parsing JSON (len={d}): ", .{data.len});
-        if (data.len < 200) {
-            std.debug.print("{s}\n", .{data});
-        } else {
-            std.debug.print("{s}...\n", .{data[0..200]});
-        }
-
         // Additional validation: check balanced brackets
         var bracket_count: i32 = 0;
         for (data) |c| {
             if (c == '[' or c == '{') bracket_count += 1;
             if (c == ']' or c == '}') bracket_count -= 1;
             if (bracket_count < 0) {
-                std.debug.print("error: unbalanced brackets\n", .{});
                 try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
                 return;
             }
         }
         if (bracket_count != 0) {
-            std.debug.print("error: unbalanced brackets (count={})\n", .{bracket_count});
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         }
@@ -1219,8 +1199,7 @@ pub const Handler = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), data, .{
             .allocate = .alloc_always,
             .max_value_len = 1024 * 1024, // 1MB max
-        }) catch |err| {
-            std.debug.print("error: {s}\n", .{@errorName(err)});
+        }) catch {
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         };
@@ -1265,6 +1244,6 @@ pub const Handler = struct {
                 i += 1;
             }
         }
-        std.debug.print("Connection closed, cleaned up subscriptions\n", .{});
+        logger.debug("Connection closed, cleaned up subscriptions", .{});
     }
 };
