@@ -877,6 +877,12 @@ pub const Handler = struct {
         for (self.context.subscribers.items) |subscriber| {
             if (!eventMatched(ev, subscriber.filters)) continue;
 
+            // Check if connection is still open
+            if (subscriber.conn._closed) {
+                std.debug.print("Skipping closed connection for subscription {s}\n", .{subscriber.sub});
+                continue;
+            }
+
             var buf: std.ArrayList(u8) = .{};
             defer buf.deinit(self.context.allocator);
             var event_writer = buf.writer(self.context.allocator);
@@ -899,7 +905,10 @@ pub const Handler = struct {
             defer self.context.allocator.free(tags);
             try event_writer.writeAll(tags);
             try event_writer.writeAll("}]");
-            try subscriber.conn.write(buf.items);
+            subscriber.conn.write(buf.items) catch |err| {
+                std.debug.print("Failed to write to subscriber {s}: {}\n", .{ subscriber.sub, err });
+                continue;
+            };
         }
 
         var buf: std.ArrayList(u8) = .{};
@@ -1219,5 +1228,18 @@ pub const Handler = struct {
         }
     }
 
-    pub fn close(_: *Handler) void {}
+    pub fn close(self: *Handler) void {
+        // Remove all subscriptions for this connection
+        var i: usize = 0;
+        while (i < self.context.subscribers.items.len) {
+            if (self.context.subscribers.items[i].conn == self.conn) {
+                var sub = self.context.subscribers.orderedRemove(i);
+                sub.deinit();
+                // Don't increment i because we removed an item
+            } else {
+                i += 1;
+            }
+        }
+        std.debug.print("Connection closed, cleaned up subscriptions\n", .{});
+    }
 };
