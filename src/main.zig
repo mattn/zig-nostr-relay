@@ -45,15 +45,15 @@ fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
         std.mem.indexOf(u8, request, "upgrade: websocket") != null;
 
     if (is_websocket) {
-        handleWebSocketUpgrade(stream, request, allocator) catch |err| {
-            std.debug.print("WebSocket error: {s}\n", .{@errorName(err)});
+        handleWebSocketUpgrade(stream, request, allocator) catch {
+            // Silently ignore WebSocket upgrade errors to avoid std.debug.print in multi-threaded context
             stream.close();
         };
-        // Note: stream is closed by conn.close() in handleWebSocketUpgrade
+        // Note: stream is closed by atomic close in handleWebSocketUpgrade
     } else {
         defer stream.close();
-        handleHttpRequest(stream, request, allocator) catch |err| {
-            std.debug.print("HTTP error: {s}\n", .{@errorName(err)});
+        handleHttpRequest(stream, request, allocator) catch {
+            // Silently ignore HTTP errors to avoid std.debug.print in multi-threaded context
         };
     }
 }
@@ -118,14 +118,14 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         reader.fill(stream) catch |err| {
             // Connection closed or error, exit gracefully
             if (err == error.EndOfStream) break;
-            std.debug.print("WebSocket fill error: {s}\n", .{@errorName(err)});
+            // Ignore other fill errors (avoid std.debug.print in multi-threaded context)
             break;
         };
 
         const read_result = reader.read() catch |err| {
             // Connection closed or error, exit gracefully
             if (err == error.EndOfStream) break;
-            std.debug.print("WebSocket read error: {s}\n", .{@errorName(err)});
+            // Ignore other read errors (avoid std.debug.print in multi-threaded context)
             break;
         };
         if (read_result == null) break;
@@ -140,7 +140,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
                     @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
                         // If connection is broken, exit gracefully
                         if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
-                        std.debug.print("Handler error: {s}\n", .{@errorName(err)});
+                        // Ignore other handler errors (avoid std.debug.print in multi-threaded context)
                         break;
                     };
                 }
