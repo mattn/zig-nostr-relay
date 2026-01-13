@@ -5,7 +5,7 @@ RUN apk add --no-cache build-base zig openssl-dev openssl-libs-static
 WORKDIR /app
 COPY . .
 
-RUN zig build -Doptimize=ReleaseSmall
+RUN zig build -Doptimize=ReleaseSafe
 
 # Final stage
 FROM alpine:latest
