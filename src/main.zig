@@ -7,6 +7,7 @@ const Handshake = websocket.Handshake;
 const pg = @import("pg");
 const struct_env = @import("struct-env");
 const relay = @import("relay.zig");
+const logger = @import("logger.zig");
 
 const Config = struct {
     database_url: []const u8 = "",
@@ -397,20 +398,20 @@ pub fn main() !void {
     const env = try struct_env.fromEnv(allocator, Config);
     defer struct_env.free(allocator, env);
 
-    std.debug.print("Initializing PostgreSQL pool with: {s}\n", .{env.database_url});
+    logger.info("Initializing PostgreSQL pool with: {s}", .{env.database_url});
     var pool = pg.Pool.initUri(allocator, try std.Uri.parse(env.database_url), .{
         .size = 5,
     }) catch |err| {
-        std.debug.print("Failed to initialize pool: {s}\n", .{@errorName(err)});
+        logger.err("Failed to initialize pool: {s}", .{@errorName(err)});
         return;
     };
     defer pool.deinit();
-    std.debug.print("Pool initialized\n", .{});
+    logger.info("Pool initialized", .{});
 
     // Initialize database schema
-    std.debug.print("Initializing database schema...\n", .{});
+    logger.info("Initializing database schema...", .{});
     try relay.initDatabase(pool);
-    std.debug.print("Database initialized\n", .{});
+    logger.info("Database initialized", .{});
 
     // Create relay context
     var context = relay.Context{
@@ -421,7 +422,7 @@ pub fn main() !void {
     };
     relay_context = &context;
 
-    std.debug.print("Starting unified server (WebSocket + HTTP) on {s}:{}\n", .{ env.relay_addr, env.relay_port });
+    logger.info("Starting unified server (WebSocket + HTTP) on {s}:{d}", .{ env.relay_addr, env.relay_port });
 
     // Start custom TCP server that routes to WebSocket or HTTP
     const address = try std.net.Address.parseIp(env.relay_addr, env.relay_port);
@@ -448,5 +449,5 @@ pub fn main() !void {
         thread.detach();
     }
 
-    std.debug.print("Shutting down server...\n", .{});
+    logger.info("Shutting down server...", .{});
 }
