@@ -358,6 +358,11 @@ fn serveStaticFileHead(url: []const u8, stream: std.net.Stream, allocator: std.m
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
+    // Ignore SIGPIPE to prevent crash when client disconnects
+    var sa_pipe: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
+    sa_pipe.handler = .{ .handler = std.posix.SIG.IGN };
+    _ = std.posix.sigaction(std.posix.SIG.PIPE, &sa_pipe, null);
+
     // Setup signal handlers
     var sa: std.posix.Sigaction = std.mem.zeroes(std.posix.Sigaction);
     sa.handler = .{ .handler = signalHandler };
@@ -399,12 +404,23 @@ pub fn main() !void {
     });
     defer server.deinit();
 
+    // Set a 1 second timeout on accept so we can check shutdown flag regularly
+    try std.posix.setsockopt(server.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &std.mem.toBytes(std.posix.timeval{
+        .sec = 1,
+        .usec = 0,
+    }));
+
     while (!shutdown_flag.load(.acquire)) {
-        var client = server.accept() catch continue;
+        var client = server.accept() catch |err| {
+            if (err == error.SocketTimeout) continue;
+            continue;
+        };
         const thread = std.Thread.spawn(.{}, handleConnection, .{ client.stream, allocator }) catch {
             client.stream.close();
             continue;
         };
         thread.detach();
     }
+
+    std.debug.print("Shutting down server...\n", .{});
 }
