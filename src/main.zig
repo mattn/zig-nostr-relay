@@ -99,11 +99,15 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
 
     while (true) {
         reader.fill(stream) catch |err| {
+            // Connection closed or error, exit gracefully
+            if (err == error.EndOfStream) break;
             std.debug.print("WebSocket fill error: {}\n", .{err});
             break;
         };
 
         const read_result = reader.read() catch |err| {
+            // Connection closed or error, exit gracefully
+            if (err == error.EndOfStream) break;
             std.debug.print("WebSocket read error: {}\n", .{err});
             break;
         };
@@ -117,6 +121,8 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
             .text, .binary => {
                 if (message.data.len > 0) {
                     @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
+                        // If connection is broken, exit gracefully
+                        if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
                         std.debug.print("Handler error: {}\n", .{err});
                         break;
                     };
@@ -124,7 +130,10 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
             },
             .close => break,
             .ping => {
-                @constCast(&conn).writePong(message.data) catch break;
+                @constCast(&conn).writePong(message.data) catch |err| {
+                    if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
+                    break;
+                };
             },
             .pong => {},
         }
