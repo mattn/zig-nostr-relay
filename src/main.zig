@@ -72,7 +72,14 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     // Create handshake response
     var reply_buf: [2048]u8 = undefined;
     const handshake_reply = try Handshake.createReply(key, null, false, &reply_buf);
-    _ = try stream.write(handshake_reply);
+
+    // Write handshake response (handle partial writes)
+    var written: usize = 0;
+    while (written < handshake_reply.len) {
+        const n = try stream.write(handshake_reply[written..]);
+        if (n == 0) return error.EndOfStream;
+        written += n;
+    }
 
     // Create a Conn wrapper for the stream
     const conn = Conn{
