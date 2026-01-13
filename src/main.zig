@@ -4,10 +4,6 @@ const Conn = websocket.Conn;
 const Message = websocket.Message;
 const Handshake = websocket.Handshake;
 
-const Secp256k1 = std.crypto.ecc.Secp256k1;
-const Scalar = Secp256k1.scalar.Scalar;
-const Sha256 = std.crypto.hash.sha2.Sha256;
-
 const pg = @import("pg");
 const struct_env = @import("struct-env");
 const relay = @import("relay.zig");
@@ -23,160 +19,325 @@ const Config = struct {
 };
 
 var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var relay_context: *relay.Context = undefined;
 
 fn signalHandler(_: i32) callconv(.c) void {
     shutdown_flag.store(true, .release);
 }
 
-fn serveStaticFile(allocator: std.mem.Allocator, socket: std.posix.socket_t, path: []const u8) !void {
-    const file = std.fs.cwd().openFile(path, .{}) catch {
-        const not_found = "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n";
-        _ = std.posix.write(socket, not_found) catch {};
+// Custom connection handler that routes to WebSocket or HTTP
+fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
+    defer stream.close();
+
+    // Peek at the request to determine if it's WebSocket or HTTP
+    var buf: [4096]u8 = undefined;
+    const bytes_read = stream.read(&buf) catch return;
+    if (bytes_read == 0) return;
+
+    const request = buf[0..bytes_read];
+
+    // Check if it's a WebSocket upgrade request
+    const is_websocket = std.mem.indexOf(u8, request, "Upgrade: websocket") != null or
+        std.mem.indexOf(u8, request, "upgrade: websocket") != null;
+
+    if (is_websocket) {
+        handleWebSocketUpgrade(stream, request, allocator) catch |err| {
+            std.debug.print("WebSocket error: {}\n", .{err});
+        };
+    } else {
+        handleHttpRequest(stream, request, allocator) catch |err| {
+            std.debug.print("HTTP error: {}\n", .{err});
+        };
+    }
+}
+
+fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
+    // Extract Sec-WebSocket-Key (case insensitive)
+    var lower_buf: [512]u8 = undefined;
+    const lower_request = blk: {
+        const len = @min(request.len, lower_buf.len);
+        for (request[0..len], 0..) |c, i| {
+            lower_buf[i] = std.ascii.toLower(c);
+        }
+        break :blk lower_buf[0..len];
+    };
+
+    const key_header = "sec-websocket-key:";
+    const key_start_lower = std.mem.indexOf(u8, lower_request, key_header) orelse return error.NoWebSocketKey;
+
+    const key_line_start = key_start_lower + key_header.len;
+    const key_line_end = std.mem.indexOfPos(u8, request, key_line_start, "\r\n") orelse
+        std.mem.indexOfPos(u8, request, key_line_start, "\n") orelse return error.InvalidKey;
+
+    const key = std.mem.trim(u8, request[key_line_start..key_line_end], &std.ascii.whitespace);
+
+    // Create handshake response
+    var reply_buf: [2048]u8 = undefined;
+    const handshake_reply = try Handshake.createReply(key, null, false, &reply_buf);
+    try stream.writeAll(handshake_reply);
+
+    // Create a Conn wrapper for the stream
+    const conn = Conn{
+        ._closed = false,
+        .started = @intCast(std.time.timestamp()),
+        .stream = stream,
+        .address = std.net.Address.initIp4([_]u8{ 127, 0, 0, 1 }, 7447),
+        .lock = std.Thread.Mutex{},
+        .compression = null,
+    };
+
+    // Create Handler
+    const handler = relay.Handler{
+        .conn = @constCast(&conn),
+        .context = relay_context,
+    };
+
+    // Handle WebSocket messages
+    const buffer_provider = try websocket.bufferProvider(allocator, .{});
+    const reader_buf = try allocator.alloc(u8, 4096);
+    defer allocator.free(reader_buf);
+
+    var reader = websocket.proto.Reader.init(reader_buf, @constCast(&buffer_provider), null);
+
+    while (true) {
+        reader.fill(stream) catch break;
+
+        const read_result = reader.read() catch break;
+        if (read_result == null) break;
+
+        const has_more = read_result.?[0];
+        const message = read_result.?[1];
+        defer reader.done(message.type);
+
+        switch (message.type) {
+            .text, .binary => {
+                @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
+                    std.debug.print("Handler error: {}\n", .{err});
+                    break;
+                };
+            },
+            .close => break,
+            .ping => {
+                @constCast(&conn).writePong(message.data) catch break;
+            },
+            .pong => {},
+        }
+
+        if (!has_more) break;
+    }
+
+    @constCast(&handler).close();
+}
+
+fn handleHttpRequest(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
+    // Parse request line
+    var lines = std.mem.splitScalar(u8, request, '\n');
+    const request_line = lines.next() orelse return error.InvalidRequest;
+
+    var parts = std.mem.splitScalar(u8, request_line, ' ');
+    const method = parts.next() orelse return error.InvalidRequest;
+    const url = parts.next() orelse return error.InvalidRequest;
+
+    // Handle OPTIONS (CORS preflight)
+    if (std.mem.eql(u8, method, "OPTIONS")) {
+        const response = "HTTP/1.1 204 No Content\r\n" ++
+            "Access-Control-Allow-Origin: *\r\n" ++
+            "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n" ++
+            "Access-Control-Allow-Headers: Accept, Content-Type, Authorization\r\n" ++
+            "\r\n";
+        try stream.writeAll(response);
         return;
+    }
+
+    // Handle HEAD (same as GET but without body)
+    if (std.mem.eql(u8, method, "HEAD")) {
+        // Check for NIP-11 request
+        if (std.mem.indexOf(u8, request, "application/nostr+json") != null) {
+            const json_len = 438; // Precomputed NIP-11 response length
+            var response_buf: [512]u8 = undefined;
+            const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/nostr+json\r\n" ++
+                "Access-Control-Allow-Origin: *\r\n" ++
+                "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n" ++
+                "Access-Control-Allow-Headers: Accept, Content-Type, Authorization\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "\r\n", .{json_len});
+            try stream.writeAll(response);
+            return;
+        }
+        // For files, return headers only
+        return serveStaticFileHead(url, stream, allocator);
+    }
+
+    if (!std.mem.eql(u8, method, "GET")) {
+        const response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n";
+        try stream.writeAll(response);
+        return;
+    }
+
+    // Check for NIP-11 request
+    if (std.mem.indexOf(u8, request, "application/nostr+json") != null) {
+        return serveNip11(stream);
+    }
+
+    // Serve static files
+    return serveStaticFile(url, stream, allocator);
+}
+
+fn serveNip11(stream: std.net.Stream) !void {
+    const json =
+        \\{"name":"zig-nostr-relay","description":"A high-performance Nostr relay written in Zig","pubkey":"","contact":"","supported_nips":[1,2,4,9,11,20,22,33,40,42],"software":"https://github.com/mattn/zig-nostr-relay","version":"0.1.0","limitation":{"max_message_length":262144,"max_subscriptions":20,"max_subid_length":256,"max_limit":1000,"max_event_tags":2000,"max_content_length":140000,"min_pow_difficulty":0,"auth_required":false,"payment_required":false,"restricted_writes":false}}
+    ;
+
+    var response_buf: [2048]u8 = undefined;
+    const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: application/nostr+json\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n" ++
+        "Access-Control-Allow-Headers: Accept, Content-Type, Authorization\r\n" ++
+        "Content-Length: {d}\r\n" ++
+        "\r\n" ++
+        "{s}", .{ json.len, json });
+
+    try stream.writeAll(response);
+}
+
+fn serveStaticFile(url: []const u8, stream: std.net.Stream, allocator: std.mem.Allocator) !void {
+    var path_buf: [1024]u8 = undefined;
+
+    // Normalize and validate path
+    const path = blk: {
+        if (std.mem.eql(u8, url, "/")) {
+            break :blk "public/index.html";
+        }
+
+        // Remove leading slash and trim
+        const sanitized = std.mem.trim(u8, url, "/");
+
+        // Check for directory traversal attempts
+        if (std.mem.indexOf(u8, sanitized, "..") != null) {
+            return error.InvalidPath;
+        }
+
+        // Check for absolute paths
+        if (sanitized.len > 0 and sanitized[0] == '/') {
+            return error.InvalidPath;
+        }
+
+        // Additional security: only allow alphanumeric, dash, underscore, dot, and slash
+        for (sanitized) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.' and c != '/') {
+                return error.InvalidPath;
+            }
+        }
+
+        const p = try std.fmt.bufPrint(&path_buf, "public/{s}", .{sanitized});
+
+        // Ensure the resolved path is still within public/
+        const abs_path = std.fs.cwd().realpathAlloc(allocator, p) catch |err| {
+            if (err == error.FileNotFound) {
+                const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                try stream.writeAll(not_found);
+                return error.FileNotFound;
+            }
+            return error.InvalidPath;
+        };
+        defer allocator.free(abs_path);
+
+        const abs_public = std.fs.cwd().realpathAlloc(allocator, "public") catch {
+            return error.InvalidPath;
+        };
+        defer allocator.free(abs_public);
+
+        if (!std.mem.startsWith(u8, abs_path, abs_public)) {
+            return error.InvalidPath;
+        }
+
+        break :blk p;
+    };
+
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        try stream.writeAll(not_found);
+        return error.FileNotFound;
     };
     defer file.close();
 
     const content = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
     defer allocator.free(content);
 
-    const content_type = if (std.mem.endsWith(u8, path, ".html"))
-        "text/html; charset=utf-8"
-    else if (std.mem.endsWith(u8, path, ".png"))
-        "image/png"
-    else if (std.mem.endsWith(u8, path, ".svg"))
-        "image/svg+xml"
-    else if (std.mem.endsWith(u8, path, ".css"))
-        "text/css"
-    else if (std.mem.endsWith(u8, path, ".js"))
-        "application/javascript"
-    else
-        "application/octet-stream";
+    const content_type = blk: {
+        if (std.mem.endsWith(u8, path, ".html")) break :blk "text/html; charset=utf-8";
+        if (std.mem.endsWith(u8, path, ".js")) break :blk "application/javascript; charset=utf-8";
+        if (std.mem.endsWith(u8, path, ".css")) break :blk "text/css; charset=utf-8";
+        if (std.mem.endsWith(u8, path, ".png")) break :blk "image/png";
+        if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) break :blk "image/jpeg";
+        if (std.mem.endsWith(u8, path, ".svg")) break :blk "image/svg+xml";
+        if (std.mem.endsWith(u8, path, ".json")) break :blk "application/json; charset=utf-8";
+        break :blk "application/octet-stream";
+    };
 
-    var response: std.ArrayList(u8) = .{};
-    defer response.deinit(allocator);
-    var writer = response.writer(allocator);
+    var response_buf: [1024]u8 = undefined;
+    const header = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: {s}\r\n" ++
+        "Content-Length: {d}\r\n" ++
+        "Cache-Control: public, max-age=3600\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "\r\n", .{ content_type, content.len });
 
-    try writer.print("HTTP/1.1 200 OK\r\n", .{});
-    try writer.print("Connection: close\r\n", .{});
-    try writer.print("Content-Type: {s}\r\n", .{content_type});
-    try writer.print("Content-Length: {}\r\n\r\n", .{content.len});
-    try writer.writeAll(content);
-
-    _ = std.posix.write(socket, response.items) catch {};
+    try stream.writeAll(header);
+    try stream.writeAll(content);
 }
 
-// https://github.com/vitalnodo/bip340/blob/main/bip340.zig
-fn taggedHash(tag: []const u8, msg: []const u8) [32]u8 {
-    var buf: [32]u8 = undefined;
-    Sha256.hash(tag, &buf, .{});
-
-    var sha256 = Sha256.init(.{});
-    sha256.update(buf[0..]);
-    sha256.update(buf[0..]);
-    sha256.update(msg);
-    sha256.final(&buf);
-    return buf;
-}
-
-fn verify(public_key: [32]u8, msg: [32]u8, signature: [64]u8) !bool {
-    const Px = try Secp256k1.Fe.fromBytes(public_key, .big);
-    const Py = try Secp256k1.recoverY(Px, false);
-    const P = try Secp256k1.fromAffineCoordinates(.{ .x = Px, .y = Py });
-    const r = try Secp256k1.Fe.fromBytes(signature[0..32].*, .big);
-    const s = try Secp256k1.scalar.Scalar.fromBytes(signature[32..64].*, .big);
-    var to_hash: [96]u8 = undefined;
-    @memcpy(to_hash[0..32], signature[0..32]);
-    @memcpy(to_hash[32..64], public_key[0..]);
-    @memcpy(to_hash[64..96], msg[0..]);
-    const e = try Scalar.fromBytes(
-        taggedHash("BIP0340/challenge", to_hash[0..]),
-        .big,
-    );
-    const R = (try Secp256k1.basePoint.mulPublic(
-        s.toBytes(.big),
-        .big,
-    )).sub(try P.mul(e.toBytes(.big), .big));
-    if (R.affineCoordinates().y.isOdd()) {
-        return false;
-    }
-    if (!R.affineCoordinates().x.equivalent(r)) {
-        return false;
-    }
-    return true;
-}
-
-fn handleHTTPRequest(allocator: std.mem.Allocator, socket: std.posix.socket_t, request: []const u8) !void {
-    // Check Accept header
-    var is_json = false;
-    if (std.mem.containsAtLeast(u8, request, 1, "Accept: application/nostr+json") or
-        std.mem.containsAtLeast(u8, request, 1, "accept: application/nostr+json"))
-    {
-        is_json = true;
-    }
-
-    if (is_json) {
-        // NIP-11 JSON
-        var response: std.ArrayList(u8) = .{};
-        defer response.deinit(allocator);
-        var writer = response.writer(allocator);
-
-        var json: std.ArrayList(u8) = .{};
-        defer json.deinit(allocator);
-        var j = json.writer(allocator);
-
-        try j.print("{{", .{});
-        try j.print("\"name\":\"zig-nostr-relay\"", .{});
-        try j.print(",\"description\":\"A high-performance Nostr relay written in Zig\"", .{});
-        try j.print(",\"logo\":\"https://zig-nostr-relay.compile-error.net/logo.png\"", .{});
-        try j.print(",\"supported_nips\":[1,2,4,9,11,20,22,33,40,42]", .{});
-        try j.print(",\"software\":\"https://github.com/mattn/zig-nostr-relay\"", .{});
-        try j.print(",\"version\":\"0.1.0\"", .{});
-        try j.print(",\"limitation\":{{", .{});
-        try j.print("\"max_message_length\":262144", .{});
-        try j.print(",\"max_subscriptions\":20", .{});
-        try j.print(",\"max_subid_length\":256", .{});
-        try j.print(",\"max_limit\":1000", .{});
-        try j.print(",\"max_event_tags\":2000", .{});
-        try j.print(",\"max_content_length\":140000", .{});
-        try j.print(",\"min_pow_difficulty\":0", .{});
-        try j.print(",\"auth_required\":false", .{});
-        try j.print(",\"payment_required\":false", .{});
-        try j.print(",\"restricted_writes\":false", .{});
-        try j.print("}}", .{});
-        try j.print("}}", .{});
-
-        try writer.print("HTTP/1.1 200 OK\r\n", .{});
-        try writer.print("Connection: close\r\n", .{});
-        try writer.print("Access-Control-Allow-Origin: *\r\n", .{});
-        try writer.print("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n", .{});
-        try writer.print("Access-Control-Allow-Headers: Accept, Content-Type\r\n", .{});
-        try writer.print("Content-Type: application/nostr+json\r\n", .{});
-        try writer.print("Content-Length: {}\r\n\r\n", .{json.items.len});
-        try writer.writeAll(json.items);
-
-        _ = std.posix.write(socket, response.items) catch {};
-    } else {
-        // Parse request path
-        var lines = std.mem.splitScalar(u8, request, '\n');
-        const first_line = lines.first();
-        var parts = std.mem.splitScalar(u8, first_line, ' ');
-        _ = parts.next(); // GET
-        const path = parts.next() orelse "/";
-
-        if (std.mem.eql(u8, path, "/")) {
-            try serveStaticFile(allocator, socket, "public/index.html");
-        } else if (std.mem.startsWith(u8, path, "/")) {
-            // Prevent directory traversal
-            if (std.mem.containsAtLeast(u8, path, 1, "..")) {
-                const not_found = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
-                _ = std.posix.write(socket, not_found) catch {};
-                return;
-            }
-            const file_path = try std.fmt.allocPrint(allocator, "public{s}", .{path});
-            defer allocator.free(file_path);
-            try serveStaticFile(allocator, socket, file_path);
+fn serveStaticFileHead(url: []const u8, stream: std.net.Stream, allocator: std.mem.Allocator) !void {
+    var path_buf: [1024]u8 = undefined;
+    const path = blk: {
+        if (std.mem.eql(u8, url, "/")) {
+            break :blk "public/index.html";
         }
-    }
+        const sanitized = std.mem.trim(u8, url, "/");
+        if (std.mem.indexOf(u8, sanitized, "..") != null) {
+            return error.InvalidPath;
+        }
+        for (sanitized) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.' and c != '/') {
+                return error.InvalidPath;
+            }
+        }
+        const p = try std.fmt.bufPrint(&path_buf, "public/{s}", .{sanitized});
+        break :blk p;
+    };
+
+    const file = std.fs.cwd().openFile(path, .{}) catch {
+        const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        try stream.writeAll(not_found);
+        return error.FileNotFound;
+    };
+    defer file.close();
+
+    const stat = try file.stat();
+
+    const content_type = blk: {
+        if (std.mem.endsWith(u8, path, ".html")) break :blk "text/html; charset=utf-8";
+        if (std.mem.endsWith(u8, path, ".js")) break :blk "application/javascript; charset=utf-8";
+        if (std.mem.endsWith(u8, path, ".css")) break :blk "text/css; charset=utf-8";
+        if (std.mem.endsWith(u8, path, ".png")) break :blk "image/png";
+        if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) break :blk "image/jpeg";
+        if (std.mem.endsWith(u8, path, ".svg")) break :blk "image/svg+xml";
+        if (std.mem.endsWith(u8, path, ".json")) break :blk "application/json; charset=utf-8";
+        break :blk "application/octet-stream";
+    };
+
+    var response_buf: [1024]u8 = undefined;
+    const header = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: {s}\r\n" ++
+        "Content-Length: {d}\r\n" ++
+        "Cache-Control: public, max-age=3600\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "\r\n", .{ content_type, stat.size });
+
+    try stream.writeAll(header);
+    _ = allocator;
 }
 
 pub fn main() !void {
@@ -212,16 +373,23 @@ pub fn main() !void {
         .subscribers = std.ArrayList(relay.Subscriber){},
         .pool = pool,
     };
+    relay_context = &context;
 
-    std.debug.print("Starting Nostr relay on {s}:{}\n", .{ env.relay_addr, env.relay_port });
+    std.debug.print("Starting unified server (WebSocket + HTTP) on {s}:{}\n", .{ env.relay_addr, env.relay_port });
 
-    // Start WebSocket server
-    var server = try websocket.Server(relay.Handler).init(allocator, .{
-        .address = env.relay_addr,
-        .port = env.relay_port,
-        .max_message_size = 262144,
+    // Start custom TCP server that routes to WebSocket or HTTP
+    const address = try std.net.Address.parseIp(env.relay_addr, env.relay_port);
+    var server = try address.listen(.{
+        .reuse_address = true,
     });
     defer server.deinit();
 
-    try server.listen(&context);
+    while (!shutdown_flag.load(.acquire)) {
+        var client = server.accept() catch continue;
+        const thread = std.Thread.spawn(.{}, handleConnection, .{ client.stream, allocator }) catch {
+            client.stream.close();
+            continue;
+        };
+        thread.detach();
+    }
 }
