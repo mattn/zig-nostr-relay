@@ -875,14 +875,24 @@ pub const Handler = struct {
             };
         }
 
-        // Notify subscribers (with mutex protection)
-        self.context.subscribers_mutex.lock();
-        defer self.context.subscribers_mutex.unlock();
+        // Notify subscribers (copy list under mutex, then process outside)
+        var subscribers_to_notify = std.ArrayList(Subscriber){};
+        defer subscribers_to_notify.deinit(self.context.allocator);
+        
+        {
+            self.context.subscribers_mutex.lock();
+            defer self.context.subscribers_mutex.unlock();
+            
+            for (self.context.subscribers.items) |subscriber| {
+                if (!eventMatched(ev, subscriber.filters)) continue;
+                if (subscriber.conn._closed) continue;
+                try subscribers_to_notify.append(self.context.allocator, subscriber);
+            }
+        }
 
-        for (self.context.subscribers.items) |subscriber| {
-            if (!eventMatched(ev, subscriber.filters)) continue;
-
-            // Check if connection is still open
+        // Now notify outside the mutex
+        for (subscribers_to_notify.items) |subscriber| {
+            // Double-check connection is still open
             if (subscriber.conn._closed) {
                 std.debug.print("Skipping closed connection for subscription {s}\n", .{subscriber.sub});
                 continue;

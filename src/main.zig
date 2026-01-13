@@ -27,12 +27,16 @@ fn signalHandler(_: i32) callconv(.c) void {
 
 // Custom connection handler that routes to WebSocket or HTTP
 fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
-    defer stream.close();
-
     // Read the initial request
     var buf: [4096]u8 = undefined;
-    const bytes_read = stream.read(&buf) catch return;
-    if (bytes_read == 0) return;
+    const bytes_read = stream.read(&buf) catch {
+        stream.close();
+        return;
+    };
+    if (bytes_read == 0) {
+        stream.close();
+        return;
+    }
 
     const request = buf[0..bytes_read];
 
@@ -43,8 +47,11 @@ fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
     if (is_websocket) {
         handleWebSocketUpgrade(stream, request, allocator) catch |err| {
             std.debug.print("WebSocket error: {}\n", .{err});
+            stream.close();
         };
+        // Note: stream is closed by conn.close() in handleWebSocketUpgrade
     } else {
+        defer stream.close();
         handleHttpRequest(stream, request, allocator) catch |err| {
             std.debug.print("HTTP error: {}\n", .{err});
         };
@@ -151,6 +158,11 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         if (!has_more) break;
     }
 
+    // Close the WebSocket connection properly
+    conn.close(.{}) catch |err| {
+        std.debug.print("Error closing WebSocket connection: {}\n", .{err});
+    };
+    
     @constCast(&handler).close();
 }
 
