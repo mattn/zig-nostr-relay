@@ -140,6 +140,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
             switch (message.type) {
                 .text, .binary => {
                     if (message.data.len > 0) {
+                        logger.debug("Received: {s}", .{message.data});
                         @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
                             // If connection is broken, exit gracefully
                             if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
