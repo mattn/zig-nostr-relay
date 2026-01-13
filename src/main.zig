@@ -398,6 +398,12 @@ pub fn main() !void {
     const env = try struct_env.fromEnv(allocator, Config);
     defer struct_env.free(allocator, env);
 
+    // Validate required configuration
+    if (env.database_url.len == 0) {
+        logger.err("DATABASE_URL environment variable is required", .{});
+        return error.MissingDatabaseUrl;
+    }
+
     logger.info("Initializing PostgreSQL pool with: {s}", .{env.database_url});
     var pool = pg.Pool.initUri(allocator, try std.Uri.parse(env.database_url), .{
         .size = 5,
