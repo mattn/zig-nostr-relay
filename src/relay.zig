@@ -1131,7 +1131,10 @@ pub const Handler = struct {
 
         // Validate data is not empty
         if (data.len == 0) {
-            try self.conn.write("[\"NOTICE\", \"error: empty message\"]");
+            self.conn.write("[\"NOTICE\", \"error: empty message\"]") catch |err| {
+                std.debug.print("Write error (empty): {}\n", .{err});
+                return err;
+            };
             return;
         }
 

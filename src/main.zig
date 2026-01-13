@@ -81,8 +81,11 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         written += n;
     }
 
-    // Create a Conn wrapper for the stream
-    const conn = Conn{
+    // Create a Conn wrapper for the stream (allocate on heap for thread safety)
+    var conn = try allocator.create(Conn);
+    defer allocator.destroy(conn);
+    
+    conn.* = Conn{
         ._closed = false,
         .started = @intCast(std.time.timestamp()),
         .stream = stream,
@@ -93,7 +96,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
 
     // Create Handler
     const handler = relay.Handler{
-        .conn = @constCast(&conn),
+        .conn = conn,
         .context = relay_context,
     };
 
@@ -137,7 +140,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
             },
             .close => break,
             .ping => {
-                @constCast(&conn).writePong(message.data) catch |err| {
+                conn.writePong(message.data) catch |err| {
                     if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
                     break;
                 };
