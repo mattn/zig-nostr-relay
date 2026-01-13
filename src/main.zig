@@ -46,14 +46,14 @@ fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
 
     if (is_websocket) {
         handleWebSocketUpgrade(stream, request, allocator) catch |err| {
-            std.debug.print("WebSocket error: {}\n", .{err});
+            std.debug.print("WebSocket error: {s}\n", .{@errorName(err)});
             stream.close();
         };
         // Note: stream is closed by conn.close() in handleWebSocketUpgrade
     } else {
         defer stream.close();
         handleHttpRequest(stream, request, allocator) catch |err| {
-            std.debug.print("HTTP error: {}\n", .{err});
+            std.debug.print("HTTP error: {s}\n", .{@errorName(err)});
         };
     }
 }
@@ -118,14 +118,14 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         reader.fill(stream) catch |err| {
             // Connection closed or error, exit gracefully
             if (err == error.EndOfStream) break;
-            std.debug.print("WebSocket fill error: {}\n", .{err});
+            std.debug.print("WebSocket fill error: {s}\n", .{@errorName(err)});
             break;
         };
 
         const read_result = reader.read() catch |err| {
             // Connection closed or error, exit gracefully
             if (err == error.EndOfStream) break;
-            std.debug.print("WebSocket read error: {}\n", .{err});
+            std.debug.print("WebSocket read error: {s}\n", .{@errorName(err)});
             break;
         };
         if (read_result == null) break;
@@ -140,7 +140,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
                     @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
                         // If connection is broken, exit gracefully
                         if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
-                        std.debug.print("Handler error: {}\n", .{err});
+                        std.debug.print("Handler error: {s}\n", .{@errorName(err)});
                         break;
                     };
                 }
@@ -160,7 +160,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
 
     // Close the WebSocket connection properly
     conn.close(.{}) catch |err| {
-        std.debug.print("Error closing WebSocket connection: {}\n", .{err});
+        std.debug.print("Error closing WebSocket connection: {s}\n", .{@errorName(err)});
     };
     
     @constCast(&handler).close();

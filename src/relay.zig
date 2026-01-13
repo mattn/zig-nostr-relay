@@ -921,7 +921,7 @@ pub const Handler = struct {
             try event_writer.writeAll(tags);
             try event_writer.writeAll("}]");
             subscriber.conn.write(buf.items) catch |err| {
-                std.debug.print("Failed to write to subscriber {s}: {}\n", .{ subscriber.sub, err });
+                std.debug.print("Failed to write to subscriber {s}: {s}\n", .{ subscriber.sub, @errorName(err) });
                 continue;
             };
         }
@@ -1163,7 +1163,7 @@ pub const Handler = struct {
         // Validate data is not empty
         if (data.len == 0) {
             self.conn.write("[\"NOTICE\", \"error: empty message\"]") catch |err| {
-                std.debug.print("Write error (empty): {}\n", .{err});
+                std.debug.print("Write error (empty): {s}\n", .{@errorName(err)});
                 return err;
             };
             return;
