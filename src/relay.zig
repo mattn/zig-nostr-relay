@@ -1135,6 +1135,20 @@ pub const Handler = struct {
             return;
         }
 
+        // Validate JSON structure - must start with [ and end with ]
+        if (data[0] != '[' or data[data.len - 1] != ']') {
+            std.debug.print("error: incomplete or malformed JSON structure\n", .{});
+            try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
+            return;
+        }
+
+        // Validate UTF-8
+        if (!std.unicode.utf8ValidateSlice(data)) {
+            std.debug.print("error: invalid UTF-8 in message\n", .{});
+            try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
+            return;
+        }
+
         const parsed = std.json.parseFromSlice(std.json.Value, self.context.allocator, data, .{
             .allocate = .alloc_if_needed,
         }) catch |err| {
