@@ -1137,7 +1137,12 @@ pub const Handler = struct {
 
         // Validate JSON structure - must start with [ and end with ]
         if (data[0] != '[' or data[data.len - 1] != ']') {
-            std.debug.print("error: incomplete or malformed JSON structure\n", .{});
+            std.debug.print("error: incomplete or malformed JSON structure (len={d}): ", .{data.len});
+            if (data.len < 100) {
+                std.debug.print("{s}\n", .{data});
+            } else {
+                std.debug.print("{s}...{s}\n", .{ data[0..50], data[data.len - 50 ..] });
+            }
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
         }
@@ -1153,9 +1158,33 @@ pub const Handler = struct {
         var arena = std.heap.ArenaAllocator.init(self.context.allocator);
         defer arena.deinit();
 
+        std.debug.print("Parsing JSON (len={d}): ", .{data.len});
+        if (data.len < 200) {
+            std.debug.print("{s}\n", .{data});
+        } else {
+            std.debug.print("{s}...\n", .{data[0..200]});
+        }
+
+        // Additional validation: check balanced brackets
+        var bracket_count: i32 = 0;
+        for (data) |c| {
+            if (c == '[' or c == '{') bracket_count += 1;
+            if (c == ']' or c == '}') bracket_count -= 1;
+            if (bracket_count < 0) {
+                std.debug.print("error: unbalanced brackets\n", .{});
+                try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
+                return;
+            }
+        }
+        if (bracket_count != 0) {
+            std.debug.print("error: unbalanced brackets (count={})\n", .{bracket_count});
+            try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
+            return;
+        }
+
         const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), data, .{
             .allocate = .alloc_always,
-            .max_value_len = null,
+            .max_value_len = 1024 * 1024, // 1MB max
         }) catch |err| {
             std.debug.print("error: {s}\n", .{@errorName(err)});
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
