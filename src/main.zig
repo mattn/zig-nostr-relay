@@ -53,14 +53,12 @@ fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
 
 fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
     // Extract Sec-WebSocket-Key (case insensitive)
-    var lower_buf: [512]u8 = undefined;
-    const lower_request = blk: {
-        const len = @min(request.len, lower_buf.len);
-        for (request[0..len], 0..) |c, i| {
-            lower_buf[i] = std.ascii.toLower(c);
-        }
-        break :blk lower_buf[0..len];
-    };
+    const lower_request = try allocator.alloc(u8, request.len);
+    defer allocator.free(lower_request);
+
+    for (request, 0..) |c, i| {
+        lower_request[i] = std.ascii.toLower(c);
+    }
 
     const key_header = "sec-websocket-key:";
     const key_start_lower = std.mem.indexOf(u8, lower_request, key_header) orelse return error.NoWebSocketKey;
