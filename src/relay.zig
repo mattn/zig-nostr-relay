@@ -97,6 +97,7 @@ pub const Subscriber = struct {
 pub const Context = struct {
     allocator: std.mem.Allocator,
     subscribers: std.ArrayList(Subscriber),
+    subscribers_mutex: std.Thread.Mutex,
     pool: *pg.Pool,
 };
 
@@ -874,6 +875,10 @@ pub const Handler = struct {
             };
         }
 
+        // Notify subscribers (with mutex protection)
+        self.context.subscribers_mutex.lock();
+        defer self.context.subscribers_mutex.unlock();
+
         for (self.context.subscribers.items) |subscriber| {
             if (!eventMatched(ev, subscriber.filters)) continue;
 
@@ -929,7 +934,11 @@ pub const Handler = struct {
 
         const filters = try make_filter(self.context.allocator, value.array);
         const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters);
+        
+        // Add subscriber with mutex protection
+        self.context.subscribers_mutex.lock();
         try self.context.subscribers.append(self.context.allocator, subscriber);
+        self.context.subscribers_mutex.unlock();
 
         const bindValue = union(enum) {
             number: i64,
@@ -1118,7 +1127,10 @@ pub const Handler = struct {
             return;
         }
 
-        // Remove subscriber from context.subscribers
+        // Remove subscriber from context.subscribers (with mutex protection)
+        self.context.subscribers_mutex.lock();
+        defer self.context.subscribers_mutex.unlock();
+        
         var i: usize = 0;
         while (i < self.context.subscribers.items.len) {
             if (std.mem.eql(u8, self.context.subscribers.items[i].sub, sub_id.string) and
@@ -1229,7 +1241,10 @@ pub const Handler = struct {
     }
 
     pub fn close(self: *Handler) void {
-        // Remove all subscriptions for this connection
+        // Remove all subscriptions for this connection (with mutex protection)
+        self.context.subscribers_mutex.lock();
+        defer self.context.subscribers_mutex.unlock();
+        
         var i: usize = 0;
         while (i < self.context.subscribers.items.len) {
             if (self.context.subscribers.items[i].conn == self.conn) {

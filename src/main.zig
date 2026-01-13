@@ -29,40 +29,29 @@ fn signalHandler(_: i32) callconv(.c) void {
 fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
     defer stream.close();
 
-    // Peek at the request to determine if it's WebSocket or HTTP (without consuming)
+    // Read the initial request
     var buf: [4096]u8 = undefined;
-    const bytes_read = std.posix.recv(stream.handle, &buf, std.posix.MSG.PEEK) catch return;
+    const bytes_read = stream.read(&buf) catch return;
     if (bytes_read == 0) return;
 
-    const request_peek = buf[0..bytes_read];
+    const request = buf[0..bytes_read];
 
     // Check if it's a WebSocket upgrade request
-    const is_websocket = std.mem.indexOf(u8, request_peek, "Upgrade: websocket") != null or
-        std.mem.indexOf(u8, request_peek, "upgrade: websocket") != null;
+    const is_websocket = std.mem.indexOf(u8, request, "Upgrade: websocket") != null or
+        std.mem.indexOf(u8, request, "upgrade: websocket") != null;
 
     if (is_websocket) {
-        handleWebSocketUpgrade(stream, allocator) catch |err| {
+        handleWebSocketUpgrade(stream, request, allocator) catch |err| {
             std.debug.print("WebSocket error: {}\n", .{err});
         };
     } else {
-        // For HTTP, we need to actually read the data
-        const bytes_read_actual = stream.read(&buf) catch return;
-        if (bytes_read_actual == 0) return;
-        const request = buf[0..bytes_read_actual];
-        
         handleHttpRequest(stream, request, allocator) catch |err| {
             std.debug.print("HTTP error: {}\n", .{err});
         };
     }
 }
 
-fn handleWebSocketUpgrade(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
-    // Read the WebSocket upgrade request
-    var buf: [4096]u8 = undefined;
-    const bytes_read = try stream.read(&buf);
-    if (bytes_read == 0) return error.EndOfStream;
-    const request = buf[0..bytes_read];
-
+fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
     // Extract Sec-WebSocket-Key (case insensitive)
     const lower_request = try allocator.alloc(u8, request.len);
     defer allocator.free(lower_request);
@@ -412,6 +401,7 @@ pub fn main() !void {
     var context = relay.Context{
         .allocator = allocator,
         .subscribers = std.ArrayList(relay.Subscriber){},
+        .subscribers_mutex = std.Thread.Mutex{},
         .pool = pool,
     };
     relay_context = &context;
