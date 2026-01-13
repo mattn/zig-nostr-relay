@@ -104,6 +104,10 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
 
     var reader = websocket.proto.Reader.init(reader_buf, @constCast(&buffer_provider), null);
 
+    // Buffer for accumulating fragmented messages
+    var message_buffer = std.ArrayList(u8){};
+    defer message_buffer.deinit(allocator);
+
     while (true) {
         reader.fill(stream) catch |err| {
             // Connection closed or error, exit gracefully
@@ -127,12 +131,18 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         switch (message.type) {
             .text, .binary => {
                 if (message.data.len > 0) {
-                    @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
-                        // If connection is broken, exit gracefully
-                        if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
-                        std.debug.print("Handler error: {}\n", .{err});
-                        break;
-                    };
+                    // Accumulate message fragments
+                    try message_buffer.appendSlice(allocator, message.data);
+
+                    // Only process when we have the complete message
+                    if (!has_more) {
+                        @constCast(&handler).clientMessage(allocator, message_buffer.items) catch |err| {
+                            // If connection is broken, exit gracefully
+                            if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
+                            std.debug.print("Handler error: {}\n", .{err});
+                        };
+                        message_buffer.clearRetainingCapacity();
+                    }
                 }
             },
             .close => break,
@@ -145,7 +155,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
             .pong => {},
         }
 
-        if (!has_more) break;
+        if (!has_more and message.type != .text and message.type != .binary) break;
     }
 
     @constCast(&handler).close();
