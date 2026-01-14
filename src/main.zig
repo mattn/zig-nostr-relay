@@ -117,7 +117,8 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
 
     while (true) {
         // Fill buffer with new data
-        reader.fill(stream) catch {
+        reader.fill(stream) catch |err| {
+            logger.debug("reader.fill error: {s}", .{@errorName(err)});
             // Connection closed or any error, exit gracefully
             break;
         };
@@ -140,9 +141,10 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
                     if (message.data.len > 0) {
                         logger.debug("Received: {s}", .{message.data});
                         @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
+                            logger.warn("clientMessage error: {s}", .{@errorName(err)});
                             // If connection is broken, exit gracefully
                             if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
-                            // Ignore other handler errors (avoid std.debug.print in multi-threaded context)
+                            // Continue processing for other errors
                         };
                     }
                 },
