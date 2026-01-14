@@ -117,10 +117,8 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
 
     while (true) {
         // Fill buffer with new data
-        reader.fill(stream) catch |err| {
-            // Connection closed or error, exit gracefully
-            if (err == error.EndOfStream or err == error.Closed) break;
-            // Ignore other fill errors (avoid std.debug.print in multi-threaded context)
+        reader.fill(stream) catch {
+            // Connection closed or any error, exit gracefully
             break;
         };
 
