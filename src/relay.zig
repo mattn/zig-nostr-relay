@@ -891,11 +891,11 @@ pub const Handler = struct {
         // Notify subscribers (copy list under mutex, then process outside)
         var subscribers_to_notify = std.ArrayList(Subscriber){};
         defer subscribers_to_notify.deinit(self.context.allocator);
-        
+
         {
             self.context.subscribers_mutex.lock();
             defer self.context.subscribers_mutex.unlock();
-            
+
             for (self.context.subscribers.items) |subscriber| {
                 if (!eventMatched(ev, subscriber.filters)) continue;
                 if (subscriber.conn._closed) continue;
@@ -956,7 +956,7 @@ pub const Handler = struct {
 
         const filters = try make_filter(self.context.allocator, value.array);
         const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters);
-        
+
         // Add subscriber with mutex protection
         self.context.subscribers_mutex.lock();
         try self.context.subscribers.append(self.context.allocator, subscriber);
@@ -1152,7 +1152,7 @@ pub const Handler = struct {
         // Remove subscriber from context.subscribers (with mutex protection)
         self.context.subscribers_mutex.lock();
         defer self.context.subscribers_mutex.unlock();
-        
+
         var i: usize = 0;
         while (i < self.context.subscribers.items.len) {
             if (std.mem.eql(u8, self.context.subscribers.items[i].sub, sub_id.string) and
@@ -1245,7 +1245,7 @@ pub const Handler = struct {
         // Remove all subscriptions for this connection (with mutex protection)
         self.context.subscribers_mutex.lock();
         defer self.context.subscribers_mutex.unlock();
-        
+
         var i: usize = 0;
         while (i < self.context.subscribers.items.len) {
             if (self.context.subscribers.items[i].conn == self.conn) {

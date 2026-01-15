@@ -46,8 +46,9 @@ fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
         std.mem.indexOf(u8, request, "upgrade: websocket") != null;
 
     if (is_websocket) {
-        handleWebSocketUpgrade(stream, request, allocator) catch {
+        handleWebSocketUpgrade(stream, request, allocator) catch |err| {
             // Silently ignore WebSocket upgrade errors to avoid std.debug.print in multi-threaded context
+            logger.debug("WebSocket error: {s}", .{@errorName(err)});
             stream.close();
         };
         // Note: stream is closed by atomic close in handleWebSocketUpgrade
@@ -92,7 +93,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     // Create a Conn wrapper for the stream (allocate on heap for thread safety)
     var conn = try allocator.create(Conn);
     defer allocator.destroy(conn);
-    
+
     conn.* = Conn{
         ._closed = false,
         .started = @intCast(std.time.timestamp()),
@@ -109,13 +110,14 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     };
 
     // Handle WebSocket messages
-    const buffer_provider = try websocket.bufferProvider(allocator, .{});
+    var buffer_provider = try websocket.bufferProvider(allocator, .{});
+    defer buffer_provider.deinit();
     const reader_buf = try allocator.alloc(u8, 4096);
     defer allocator.free(reader_buf);
 
     var reader = websocket.proto.Reader.init(reader_buf, @constCast(&buffer_provider), null);
 
-    while (true) {
+    main_loop: while (true) {
         // Fill buffer with new data
         reader.fill(stream) catch |err| {
             // WouldBlock means no data available (non-blocking socket), retry the read
@@ -124,7 +126,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
             }
             logger.debug("reader.fill error: {s}", .{@errorName(err)});
             // Connection closed or other error, exit gracefully
-            break;
+            break :main_loop;
         };
 
         // Process all messages in the buffer
@@ -133,12 +135,16 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
                 // Connection closed or error, exit gracefully
                 if (err == error.EndOfStream) break;
                 // Ignore other read errors (avoid std.debug.print in multi-threaded context)
+                logger.debug("reader.read error: {s}", .{@errorName(err)});
                 break;
             } orelse break; // Need more data, go back to fill()
 
             const has_more = read_result[0];
             const message = read_result[1];
-            defer reader.done(message.type);
+
+            defer {
+                reader.done(message.type);
+            }
 
             switch (message.type) {
                 .text, .binary => {
@@ -147,15 +153,19 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
                         @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
                             logger.warn("clientMessage error: {s}", .{@errorName(err)});
                             // If connection is broken, exit gracefully
-                            if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break;
+                            if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break :main_loop;
                             // Continue processing for other errors
                         };
                     }
                 },
-                .close => return, // Exit both loops
+                .close => {
+                    // WebSocket close frame received, exit gracefully
+                    logger.debug("WebSocket close frame received", .{});
+                    break :main_loop;
+                },
                 .ping => {
                     conn.writePong(message.data) catch |err| {
-                        if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) return;
+                        if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break :main_loop;
                     };
                 },
                 .pong => {},
@@ -167,12 +177,11 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
 
     // Close the handler first (removes subscriptions)
     @constCast(&handler).close();
-    
+
     // Mark as closed and close socket directly without sending close frame
     // (avoids panic when client has already disconnected)
-    if (@atomicRmw(bool, &conn._closed, .Xchg, true, .monotonic) == false) {
-        std.posix.close(stream.handle);
-    }
+    _ = @atomicRmw(bool, &conn._closed, .Xchg, true, .monotonic);
+    stream.close();
 }
 
 fn handleHttpRequest(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
