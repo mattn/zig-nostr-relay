@@ -15,8 +15,10 @@ const Config = struct {
     relay_port: u16 = 7447,
     relay_name: []const u8 = "zig-nostr-relay",
     relay_description: []const u8 = "A high-performance Nostr relay written in Zig",
+    relay_url: []const u8 = "",
     relay_pubkey: []const u8 = "",
     relay_contact: []const u8 = "",
+    relay_icon: []const u8 = "",
 };
 
 var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -233,17 +235,39 @@ fn handleHttpRequest(stream: std.net.Stream, request: []const u8, allocator: std
 
     // Check for NIP-11 request
     if (std.mem.indexOf(u8, request, "application/nostr+json") != null) {
-        return serveNip11(stream);
+        return serveNip11(stream, allocator);
     }
 
     // Serve static files
     return serveStaticFile(url, stream, allocator);
 }
 
-fn serveNip11(stream: std.net.Stream) !void {
-    const json =
-        \\{"name":"zig-nostr-relay","description":"A high-performance Nostr relay written in Zig","pubkey":"","contact":"","supported_nips":[1,2,4,9,11,20,22,33,40,42],"software":"https://github.com/mattn/zig-nostr-relay","version":"0.1.0","limitation":{"max_message_length":262144,"max_subscriptions":20,"max_subid_length":256,"max_limit":1000,"max_event_tags":2000,"max_content_length":140000,"min_pow_difficulty":0,"auth_required":false,"payment_required":false,"restricted_writes":false}}
-    ;
+const Nip11Response = struct {
+    name: []const u8,
+    description: []const u8,
+    pubkey: []const u8,
+    contact: []const u8,
+    url: ?[]const u8 = null,
+    icon: ?[]const u8 = null,
+    supported_nips: [10]u32 = [_]u32{ 1, 2, 4, 9, 11, 20, 22, 33, 40, 42 },
+    software: []const u8 = "https://github.com/mattn/zig-nostr-relay",
+    version: []const u8 = "0.1.0",
+};
+
+fn serveNip11(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
+    const response_data = Nip11Response{
+        .name = relay_context.config.relay_name,
+        .description = relay_context.config.relay_description,
+        .pubkey = relay_context.config.relay_pubkey,
+        .contact = relay_context.config.relay_contact,
+        .url = if (relay_context.config.relay_url.len > 0) relay_context.config.relay_url else null,
+        .icon = if (relay_context.config.relay_icon.len > 0) relay_context.config.relay_icon else null,
+    };
+
+    var json_buf = std.ArrayList(u8){};
+    defer json_buf.deinit(allocator);
+
+    try std.fmt.format(json_buf.writer(allocator), "{f}", .{std.json.fmt(response_data, .{})});
 
     var response_buf: [2048]u8 = undefined;
     const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\n" ++
@@ -253,7 +277,7 @@ fn serveNip11(stream: std.net.Stream) !void {
         "Access-Control-Allow-Headers: Accept, Content-Type, Authorization\r\n" ++
         "Content-Length: {d}\r\n" ++
         "\r\n" ++
-        "{s}", .{ json.len, json });
+        "{s}", .{ json_buf.items.len, json_buf.items });
 
     try stream.writeAll(response);
 }
@@ -440,6 +464,14 @@ pub fn main() !void {
         .subscribers = std.ArrayList(relay.Subscriber){},
         .subscribers_mutex = std.Thread.Mutex{},
         .pool = pool,
+        .config = .{
+            .relay_name = env.relay_name,
+            .relay_description = env.relay_description,
+            .relay_url = env.relay_url,
+            .relay_pubkey = env.relay_pubkey,
+            .relay_contact = env.relay_contact,
+            .relay_icon = env.relay_icon,
+        },
     };
     relay_context = &context;
 

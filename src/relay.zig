@@ -107,11 +107,21 @@ pub const Subscriber = struct {
     }
 };
 
+pub const Config = struct {
+    relay_name: []const u8,
+    relay_description: []const u8,
+    relay_url: []const u8,
+    relay_pubkey: []const u8,
+    relay_contact: []const u8,
+    relay_icon: []const u8,
+};
+
 pub const Context = struct {
     allocator: std.mem.Allocator,
     subscribers: std.ArrayList(Subscriber),
     subscribers_mutex: std.Thread.Mutex,
     pool: *pg.Pool,
+    config: Config,
 };
 
 pub fn initDatabase(pool: *pg.Pool) !void {
@@ -145,19 +155,6 @@ pub fn initDatabase(pool: *pg.Pool) !void {
         \\CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);
     , .{});
 }
-
-const Config = struct {
-    db_host: []const u8 = "localhost",
-    db_port: u16 = 5432,
-    db_database: []const u8 = "zig-nostr-relay",
-    db_username: []const u8 = "postgres",
-    db_password: []const u8 = "postgres",
-    db_use_tls: bool = false,
-    db_ca_bundle: []const u8 = undefined,
-    db_timeout: u32 = 10_000,
-    relay_addr: []const u8 = "0.0.0.0",
-    relay_port: u16 = 7447,
-};
 
 // https://github.com/vitalnodo/bip340/blob/main/bip340.zig
 fn taggedHash(tag: []const u8, msg: []const u8) [32]u8 {
