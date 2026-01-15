@@ -110,9 +110,10 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     };
 
     // Handle WebSocket messages
+    // Use larger reader buffer to handle bigger frames
     var buffer_provider = try websocket.bufferProvider(allocator, .{});
     defer buffer_provider.deinit();
-    const reader_buf = try allocator.alloc(u8, 4096);
+    const reader_buf = try allocator.alloc(u8, 512 * 1024); // 512KB buffer
     defer allocator.free(reader_buf);
 
     var reader = websocket.proto.Reader.init(reader_buf, @constCast(&buffer_provider), null);
@@ -134,9 +135,9 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
             const read_result = reader.read() catch |err| {
                 // Connection closed or error, exit gracefully
                 if (err == error.EndOfStream) break;
-                // Ignore other read errors (avoid std.debug.print in multi-threaded context)
-                logger.debug("reader.read error: {s}", .{@errorName(err)});
-                break;
+                // TooLarge and other errors leave reader in invalid state - exit completely
+                logger.debug("reader.read error: {s}, exiting", .{@errorName(err)});
+                break :main_loop;
             } orelse break; // Need more data, go back to fill()
 
             const has_more = read_result[0];

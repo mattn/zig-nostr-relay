@@ -1169,11 +1169,17 @@ pub const Handler = struct {
     pub fn clientMessage(self: *Handler, allocator: std.mem.Allocator, data: []const u8) !void {
         _ = allocator;
 
-        // Validate data is not empty
+        // Validate data is not empty and not too large
         if (data.len == 0) {
             self.conn.write("[\"NOTICE\", \"error: empty message\"]") catch |err| {
                 return err;
             };
+            return;
+        }
+
+        // Limit message size to 256KB to avoid websocket frame size issues
+        if (data.len > 256 * 1024) {
+            try self.conn.write("[\"NOTICE\", \"error: message too large\"]");
             return;
         }
 
