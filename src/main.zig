@@ -118,8 +118,12 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     while (true) {
         // Fill buffer with new data
         reader.fill(stream) catch |err| {
+            // WouldBlock means no data available (non-blocking socket), retry the read
+            if (err == error.WouldBlock) {
+                continue;
+            }
             logger.debug("reader.fill error: {s}", .{@errorName(err)});
-            // Connection closed or any error, exit gracefully
+            // Connection closed or other error, exit gracefully
             break;
         };
 
