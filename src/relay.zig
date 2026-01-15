@@ -60,9 +60,21 @@ const Filter = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.ids.items) |id| {
+            self.allocator.free(id);
+        }
         self.ids.deinit(self.allocator);
+        for (self.authors.items) |author| {
+            self.allocator.free(author);
+        }
         self.authors.deinit(self.allocator);
         self.kinds.deinit(self.allocator);
+        for (self.tags.items) |tag| {
+            for (tag) |item| {
+                self.allocator.free(item);
+            }
+            self.allocator.free(tag);
+        }
         self.tags.deinit(self.allocator);
         if (self.search.len > 0) self.allocator.free(self.search);
     }
@@ -569,7 +581,7 @@ pub const Handler = struct {
         return false;
     }
 
-    fn idInSlice(haystack: [][]const u8, needle: []u8) bool {
+    fn idInSlice(haystack: [][]const u8, needle: []const u8) bool {
         for (haystack) |item| {
             if (std.mem.eql(u8, item, needle)) {
                 return true;
@@ -766,14 +778,14 @@ pub const Handler = struct {
                     if (ids.? != .array) continue;
                     for (ids.?.array.items) |id| {
                         if (id != .string) continue;
-                        try filter.ids.append(allocator, id.string);
+                        try filter.ids.append(allocator, try allocator.dupe(u8, id.string));
                     }
                 } else if (std.mem.eql(u8, key, "authors")) {
                     const authors = elem.object.get(key);
                     if (authors.? != .array) continue;
                     for (authors.?.array.items) |pubkey| {
                         if (pubkey != .string) continue;
-                        try filter.authors.append(allocator, pubkey.string);
+                        try filter.authors.append(allocator, try allocator.dupe(u8, pubkey.string));
                     }
                 } else if (std.mem.eql(u8, key, "tags")) {
                     const tags = elem.object.get(key);
@@ -782,7 +794,7 @@ pub const Handler = struct {
                         if (tag != .array) continue;
                         var newarr = std.ArrayList([]const u8){};
                         for (tag.array.items) |v| {
-                            try newarr.append(allocator, v.string);
+                            try newarr.append(allocator, try allocator.dupe(u8, v.string));
                         }
                         try filter.tags.append(allocator, newarr.items);
                     }
@@ -790,9 +802,9 @@ pub const Handler = struct {
                     const tag = elem.object.get(key);
                     if (tag.? != .array) continue;
                     var newarr = std.ArrayList([]const u8){};
-                    try newarr.append(allocator, key[1..]);
+                    try newarr.append(allocator, try allocator.dupe(u8, key[1..]));
                     for (tag.?.array.items) |v| {
-                        try newarr.append(allocator, v.string);
+                        try newarr.append(allocator, try allocator.dupe(u8, v.string));
                     }
                     try filter.tags.append(allocator, newarr.items);
                 } else if (std.mem.eql(u8, key, "kinds")) {
@@ -813,7 +825,7 @@ pub const Handler = struct {
                 } else if (std.mem.eql(u8, key, "search")) {
                     const search = elem.object.get(key);
                     if (search.? != .string) continue;
-                    filter.search = search.?.string;
+                    filter.search = try allocator.dupe(u8, search.?.string);
                 } else if (std.mem.eql(u8, key, "limit")) {
                     const limit = elem.object.get(key);
                     if (limit.? != .integer) continue;
