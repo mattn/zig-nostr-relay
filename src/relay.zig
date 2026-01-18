@@ -600,16 +600,29 @@ pub const Handler = struct {
     }
 
     fn eventMatched(event: Event, filters: std.ArrayList(*Filter)) bool {
+        if (filters.items.len == 0) return true;
+
         for (filters.items) |filter| {
-            if (filter.empty()) return true;
-            if (idInSlice(filter.ids.items, event.id)) return true;
-            if (idInSlice(filter.authors.items, event.pubkey)) return true;
-            if (tagsInSlice(filter.tags.items, event.tags)) return true;
-            if (kindInSlice(filter.kinds.items, event.kind)) return true;
-            if (filter.since > 0 and event.created_at >= filter.since) return true;
-            if (filter.until > 0 and event.created_at <= filter.until) return true;
+            if (filterMatches(event, filter)) {
+                return true;
+            }
         }
         return false;
+    }
+
+    fn filterMatches(event: Event, filter: *Filter) bool {
+        // Each condition in a filter is AND'd together
+        if (filter.ids.items.len > 0 and !idInSlice(filter.ids.items, event.id)) return false;
+        if (filter.authors.items.len > 0 and !idInSlice(filter.authors.items, event.pubkey)) return false;
+        if (filter.kinds.items.len > 0 and !kindInSlice(filter.kinds.items, event.kind)) return false;
+        if (filter.tags.items.len > 0 and !tagsInSlice(filter.tags.items, event.tags)) return false;
+        if (filter.since > 0 and event.created_at < filter.since) return false;
+        if (filter.until > 0 and event.created_at > filter.until) return false;
+        if (filter.search.len > 0) {
+            // Simple substring search in content
+            if (std.mem.indexOf(u8, event.content, filter.search) == null) return false;
+        }
+        return true;
     }
 
     fn delete_record_by_id(self: *Handler, tag: [][]u8) !bool {
@@ -839,6 +852,8 @@ pub const Handler = struct {
         const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, value.array.items[1], .{});
         const ev = parsedEvent.value;
 
+        logger.info("Received EVENT: id={s}, kind={d}, pubkey={s}", .{ ev.id[0..16], ev.kind, ev.pubkey[0..16] });
+
         const verified = verify_event(self.context.allocator, ev) catch |err| {
             logger.warn("Event verification failed: {s}", .{@errorName(err)});
             return;
@@ -847,6 +862,7 @@ pub const Handler = struct {
             logger.warn("Event has invalid signature", .{});
             return;
         }
+        logger.debug("Event signature verified", .{});
 
         if (ev.kind == 5) {
             for (ev.tags) |tag| {
@@ -893,9 +909,17 @@ pub const Handler = struct {
             self.context.subscribers_mutex.lock();
             defer self.context.subscribers_mutex.unlock();
 
+            logger.debug("Broadcasting event kind={d} to {d} subscribers", .{ ev.kind, self.context.subscribers.items.len });
             for (self.context.subscribers.items) |subscriber| {
-                if (!eventMatched(ev, subscriber.filters)) continue;
-                if (subscriber.conn._closed) continue;
+                if (subscriber.conn._closed) {
+                    logger.debug("  Subscriber {s}: connection closed", .{subscriber.sub});
+                    continue;
+                }
+                if (!eventMatched(ev, subscriber.filters)) {
+                    logger.debug("  Subscriber {s}: event doesn't match filters", .{subscriber.sub});
+                    continue;
+                }
+                logger.debug("  Subscriber {s}: event matches, queuing for notification", .{subscriber.sub});
                 try subscribers_to_notify.append(self.context.allocator, subscriber);
             }
         }
@@ -952,11 +976,13 @@ pub const Handler = struct {
         const sub = value.array.items[1].string;
 
         const filters = try make_filter(self.context.allocator, value.array);
+        logger.info("Received REQ: subscription={s}, filters={d}", .{ sub, filters.items.len });
         const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters);
 
         // Add subscriber with mutex protection
         self.context.subscribers_mutex.lock();
         try self.context.subscribers.append(self.context.allocator, subscriber);
+        logger.debug("Added subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
         self.context.subscribers_mutex.unlock();
 
         const bindValue = union(enum) {
