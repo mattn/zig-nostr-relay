@@ -445,7 +445,7 @@ pub fn main() !void {
 
     logger.info("Initializing PostgreSQL pool with: {s}", .{env.database_url});
     var pool = pg.Pool.initUri(allocator, try std.Uri.parse(env.database_url), .{
-        .size = 5,
+        .size = 32,
     }) catch |err| {
         logger.err("Failed to initialize pool: {s}", .{@errorName(err)});
         return;
