@@ -57,9 +57,9 @@ pub fn build(b: *std.Build) void {
     });
 
     // Link OpenSSL libraries
-    exe.linkSystemLibrary("ssl");
-    exe.linkSystemLibrary("crypto");
-    exe.linkLibC();
+    exe.root_module.linkSystemLibrary("ssl", .{});
+    exe.root_module.linkSystemLibrary("crypto", .{});
+    exe.root_module.link_libc = true;
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default

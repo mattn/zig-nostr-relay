@@ -984,8 +984,8 @@ pub const Handler = struct {
         self.context.subscribers_mutex.lock();
         var replaced = false;
         for (self.context.subscribers.items, 0..) |*existing, i| {
-            if (existing.conn == self.conn and std.mem.eql(u8, existing.id, sub)) {
-                existing.deinit(self.context.allocator);
+            if (existing.conn == self.conn and std.mem.eql(u8, existing.sub, sub)) {
+                existing.deinit();
                 self.context.subscribers.items[i] = subscriber;
                 replaced = true;
                 logger.debug("Replaced existing subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
