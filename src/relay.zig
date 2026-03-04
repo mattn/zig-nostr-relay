@@ -120,6 +120,7 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     subscribers: std.ArrayList(Subscriber),
     subscribers_mutex: std.Thread.Mutex,
+    broadcast_count: u32 = 0,
     pool: *pg.Pool,
     config: Config,
 };
@@ -902,6 +903,10 @@ pub const Handler = struct {
         }
 
         // Notify subscribers (copy list under mutex, then process outside)
+        // Increment broadcast counter to prevent conn from being freed during broadcast
+        _ = @atomicRmw(u32, &self.context.broadcast_count, .Add, 1, .acquire);
+        defer _ = @atomicRmw(u32, &self.context.broadcast_count, .Sub, 1, .release);
+
         var subscribers_to_notify = std.ArrayList(Subscriber){};
         defer subscribers_to_notify.deinit(self.context.allocator);
 

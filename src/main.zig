@@ -178,13 +178,22 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         }
     }
 
-    // Close the handler first (removes subscriptions)
+    // Mark as closed FIRST so any in-flight broadcast will skip this connection
+    _ = @atomicRmw(bool, &conn._closed, .Xchg, true, .monotonic);
+
+    // Close socket directly without sending close frame
+    // (avoids panic when client has already disconnected)
+    stream.close();
+
+    // Remove subscriptions (prevents new broadcasts from including this connection)
     @constCast(&handler).close();
 
-    // Mark as closed and close socket directly without sending close frame
-    // (avoids panic when client has already disconnected)
-    _ = @atomicRmw(bool, &conn._closed, .Xchg, true, .monotonic);
-    stream.close();
+    // Wait for any active broadcasts to finish before freeing conn memory.
+    // After _closed is set and subscriptions are removed, no new broadcast will
+    // reference this conn. We just need existing broadcasts to complete.
+    while (@atomicLoad(u32, &relay_context.broadcast_count, .acquire) > 0) {
+        std.atomic.spinLoopHint();
+    }
 }
 
 fn handleHttpRequest(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
