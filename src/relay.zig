@@ -916,7 +916,7 @@ pub const Handler = struct {
 
             logger.debug("Broadcasting event kind={d} to {d} subscribers", .{ ev.kind, self.context.subscribers.items.len });
             for (self.context.subscribers.items) |subscriber| {
-                if (subscriber.conn._closed) {
+                if (@atomicLoad(bool, &subscriber.conn._closed, .monotonic)) {
                     logger.debug("  Subscriber {s}: connection closed", .{subscriber.sub});
                     continue;
                 }
@@ -932,7 +932,7 @@ pub const Handler = struct {
         // Now notify outside the mutex
         for (subscribers_to_notify.items) |subscriber| {
             // Double-check connection is still open
-            if (subscriber.conn._closed) {
+            if (@atomicLoad(bool, &subscriber.conn._closed, .monotonic)) {
                 continue;
             }
 
