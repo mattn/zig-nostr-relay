@@ -92,6 +92,12 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         written += n;
     }
 
+    // Set write timeout on client socket to prevent blocking on slow subscribers
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &std.mem.toBytes(std.posix.timeval{
+        .sec = 5,
+        .usec = 0,
+    })) catch {};
+
     // Create a Conn wrapper for the stream (allocate on heap for thread safety)
     var conn = try allocator.create(Conn);
     defer allocator.destroy(conn);
