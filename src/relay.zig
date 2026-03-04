@@ -986,22 +986,24 @@ pub const Handler = struct {
 
         // Add subscriber with mutex protection
         // Per NIP-01: if subscription_id already exists for this connection, replace it
-        self.context.subscribers_mutex.lock();
-        var replaced = false;
-        for (self.context.subscribers.items, 0..) |*existing, i| {
-            if (existing.conn == self.conn and std.mem.eql(u8, existing.sub, sub)) {
-                existing.deinit();
-                self.context.subscribers.items[i] = subscriber;
-                replaced = true;
-                logger.debug("Replaced existing subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
-                break;
+        {
+            self.context.subscribers_mutex.lock();
+            defer self.context.subscribers_mutex.unlock();
+            var replaced = false;
+            for (self.context.subscribers.items, 0..) |*existing, i| {
+                if (existing.conn == self.conn and std.mem.eql(u8, existing.sub, sub)) {
+                    existing.deinit();
+                    self.context.subscribers.items[i] = subscriber;
+                    replaced = true;
+                    logger.debug("Replaced existing subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
+                    break;
+                }
+            }
+            if (!replaced) {
+                try self.context.subscribers.append(self.context.allocator, subscriber);
+                logger.debug("Added subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
             }
         }
-        if (!replaced) {
-            try self.context.subscribers.append(self.context.allocator, subscriber);
-            logger.debug("Added subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
-        }
-        self.context.subscribers_mutex.unlock();
 
         const bindValue = union(enum) {
             number: i64,
