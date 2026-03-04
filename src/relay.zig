@@ -929,43 +929,46 @@ pub const Handler = struct {
             }
         }
 
+        // Build event JSON and send to all matching subscribers
+        const tags = try make_tagsj(self.context.allocator, ev);
+        defer self.context.allocator.free(tags);
+
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.context.allocator);
+
         // Now notify outside the mutex
         for (subscribers_to_notify.items) |subscriber| {
-            // Double-check connection is still open
+            // Double-check connection is still open (atomic read)
             if (@atomicLoad(bool, &subscriber.conn._closed, .monotonic)) {
                 continue;
             }
 
-            var buf: std.ArrayList(u8) = .{};
-            defer buf.deinit(self.context.allocator);
-            var event_writer = buf.writer(self.context.allocator);
-            try event_writer.writeAll("[\"EVENT\",\"");
-            try event_writer.writeAll(subscriber.sub);
-            try event_writer.writeAll("\",{\"id\":\"");
-            try event_writer.writeAll(ev.id);
-            try event_writer.writeAll("\",\"kind\":");
-            try event_writer.print("{d}", .{ev.kind});
-            try event_writer.writeAll(",\"created_at\":");
-            try event_writer.print("{d}", .{ev.created_at});
-            try event_writer.writeAll(",\"pubkey\":\"");
-            try event_writer.writeAll(ev.pubkey);
-            try event_writer.writeAll("\",\"content\":\"");
-            try event_writer.writeAll(ev.content);
-            try event_writer.writeAll("\",\"sig\":\"");
-            try event_writer.writeAll(ev.sig);
-            try event_writer.writeAll("\",\"tags\":");
-            const tags = try make_tagsj(self.context.allocator, ev);
-            defer self.context.allocator.free(tags);
-            try event_writer.writeAll(tags);
-            try event_writer.writeAll("}]");
-            subscriber.conn.write(buf.items) catch {
-                // Silently ignore write errors (connection probably closed)
+            buf.clearRetainingCapacity();
+            var ew = buf.writer(self.context.allocator);
+            try ew.writeAll("[\"EVENT\",\"");
+            try ew.writeAll(subscriber.sub);
+            try ew.writeAll("\",{\"id\":\"");
+            try ew.writeAll(ev.id);
+            try ew.writeAll("\",\"kind\":");
+            try ew.print("{d}", .{ev.kind});
+            try ew.writeAll(",\"created_at\":");
+            try ew.print("{d}", .{ev.created_at});
+            try ew.writeAll(",\"pubkey\":\"");
+            try ew.writeAll(ev.pubkey);
+            try ew.writeAll("\",\"content\":\"");
+            try ew.writeAll(ev.content);
+            try ew.writeAll("\",\"sig\":\"");
+            try ew.writeAll(ev.sig);
+            try ew.writeAll("\",\"tags\":");
+            try ew.writeAll(tags);
+            try ew.writeAll("}]");
+            subscriber.conn.write(buf.items) catch |err| {
+                logger.debug("Broadcast write error to subscriber {s}: {s}", .{ subscriber.sub, @errorName(err) });
                 continue;
             };
         }
 
-        var buf: std.ArrayList(u8) = .{};
-        defer buf.deinit(self.context.allocator);
+        buf.clearRetainingCapacity();
         var ok_writer = buf.writer(self.context.allocator);
         try ok_writer.writeAll("[\"OK\",\"");
         try ok_writer.writeAll(ev.id);
