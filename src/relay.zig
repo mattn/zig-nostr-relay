@@ -12,6 +12,28 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const pg = @import("pg");
 const struct_env = @import("struct-env");
 
+/// Write a JSON-encoded string (with surrounding quotes) to an ArrayList writer.
+/// Escapes \, ", and control characters as required by RFC 8259.
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    try writer.writeAll("\"");
+    for (s) |c| {
+        switch (c) {
+            '\\' => try writer.writeAll("\\\\"),
+            '"' => try writer.writeAll("\\\""),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0C => try writer.writeAll("\\f"),
+            0x00...0x07, 0x0B, 0x0E...0x1F => {
+                try writer.print("\\u{x:0>4}", .{@as(u16, c)});
+            },
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeAll("\"");
+}
+
 const Event = struct {
     id: []u8,
     kind: i32 = 0,
@@ -208,9 +230,7 @@ fn make_tagsj(allocator: std.mem.Allocator, ev: Event) ![]const u8 {
         try writer.writeAll("[");
         for (tag, 0..) |item, j| {
             if (j > 0) try writer.writeAll(",");
-            try writer.writeAll("\"");
-            try writer.writeAll(item);
-            try writer.writeAll("\"");
+            try writeJsonString(writer, item);
         }
         try writer.writeAll("]");
     }
@@ -463,7 +483,7 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
         const sig = row.get([]u8, 6);
 
         try response.writer(allocator).print("[\"EVENT\",\"{s}\",{{\"id\":\"{s}\",\"pubkey\":\"{s}\",\"created_at\":{},\"kind\":{},\"tags\":{s},\"content\":", .{ sub_id.string, id, pubkey, created_at, kind, tags });
-        try std.json.encodeJsonString(content, .{}, response.writer(allocator));
+        try writeJsonString(response.writer(allocator), content);
         try response.writer(allocator).print(",\"sig\":\"{s}\"}}]", .{sig});
 
         _ = std.posix.write(socket, response.items) catch {};
@@ -530,17 +550,15 @@ pub fn verifyEvent(allocator: std.mem.Allocator, ev: Event) !bool {
         try writer.writeAll("[");
         for (tag, 0..) |v, j| {
             if (j > 0) try writer.writeAll(",");
-            try writer.writeAll("\"");
-            try writer.writeAll(v);
-            try writer.writeAll("\"");
+            try writeJsonString(writer, v);
         }
         try writer.writeAll("]");
     }
     try writer.writeAll("]");
 
-    try writer.writeAll(",\"");
-    try writer.writeAll(ev.content);
-    try writer.writeAll("\"]");
+    try writer.writeAll(",");
+    try writeJsonString(writer, ev.content);
+    try writer.writeAll("]");
 
     var msgbuf: [32]u8 = undefined;
     var sha256 = Sha256.init(.{});
@@ -752,15 +770,13 @@ pub const Handler = struct {
             try writer.writeAll("[");
             for (tag, 0..) |item, j| {
                 if (j > 0) try writer.writeAll(",");
-                try writer.writeAll("\"");
-                try writer.writeAll(item);
-                try writer.writeAll("\"");
+                try writeJsonString(writer, item);
             }
             try writer.writeAll("]");
         }
-        try writer.writeAll("],\"");
-        try writer.writeAll(ev.content);
-        try writer.writeAll("\"]");
+        try writer.writeAll("],");
+        try writeJsonString(writer, ev.content);
+        try writer.writeAll("]");
 
         var msgbuf: [32]u8 = undefined;
         var sha256 = Sha256.init(.{});
@@ -955,9 +971,9 @@ pub const Handler = struct {
             try ew.print("{d}", .{ev.created_at});
             try ew.writeAll(",\"pubkey\":\"");
             try ew.writeAll(ev.pubkey);
-            try ew.writeAll("\",\"content\":\"");
-            try ew.writeAll(ev.content);
-            try ew.writeAll("\",\"sig\":\"");
+            try ew.writeAll("\",\"content\":");
+            try writeJsonString(ew, ev.content);
+            try ew.writeAll(",\"sig\":\"");
             try ew.writeAll(ev.sig);
             try ew.writeAll("\",\"tags\":");
             try ew.writeAll(tags);
@@ -1164,9 +1180,9 @@ pub const Handler = struct {
             try event_writer.print("{d}", .{created_at});
             try event_writer.writeAll(",\"pubkey\":\"");
             try event_writer.writeAll(pubkey);
-            try event_writer.writeAll("\",\"content\":\"");
-            try event_writer.writeAll(content);
-            try event_writer.writeAll("\",\"sig\":\"");
+            try event_writer.writeAll("\",\"content\":");
+            try writeJsonString(event_writer, content);
+            try event_writer.writeAll(",\"sig\":\"");
             try event_writer.writeAll(sig);
             try event_writer.writeAll("\",\"tags\":");
             try event_writer.writeAll(tagsj);
