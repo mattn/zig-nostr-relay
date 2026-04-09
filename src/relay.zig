@@ -1141,53 +1141,68 @@ pub const Handler = struct {
 
         try sql_writer.print(" ORDER BY created_at DESC LIMIT {}", .{limit});
 
-        const db = try self.context.pool.acquire();
-        defer self.context.pool.release(db);
+        // Collect all event messages in memory first, then release DB connection
+        // before writing to the (potentially slow) client socket.
+        var messages: std.ArrayList([]u8) = .{};
+        defer {
+            for (messages.items) |msg| self.context.allocator.free(msg);
+            messages.deinit(self.context.allocator);
+        }
 
-        var stmt = try pg.Stmt.init(db, .{});
+        {
+            const db = try self.context.pool.acquire();
+            defer self.context.pool.release(db);
 
-        try stmt.prepare(sqlbuf.items, null);
-        for (params.items) |param| {
-            switch (param) {
-                .number => |number| try stmt.bind(number),
-                .string => |string| try stmt.bind(@constCast(string)),
+            var stmt = try pg.Stmt.init(db, .{});
+
+            try stmt.prepare(sqlbuf.items, null);
+            for (params.items) |param| {
+                switch (param) {
+                    .number => |number| try stmt.bind(number),
+                    .string => |string| try stmt.bind(@constCast(string)),
+                }
+            }
+            var res = try stmt.execute();
+            defer res.deinit();
+
+            while (try res.next()) |row| {
+                if (row.values.len != 7) break;
+
+                const id = row.get([]u8, 0);
+                const pubkey = row.get([]u8, 1);
+                const created_at = row.get(i32, 2);
+                const kind = row.get(i32, 3);
+                const tagsj = row.get([]u8, 4);
+                const content = row.get([]u8, 5);
+                const sig = row.get([]u8, 6);
+
+                var buf: std.ArrayList(u8) = .{};
+                errdefer buf.deinit(self.context.allocator);
+                var event_writer = buf.writer(self.context.allocator);
+                try event_writer.writeAll("[\"EVENT\",\"");
+                try event_writer.writeAll(sub);
+                try event_writer.writeAll("\",{\"id\":\"");
+                try event_writer.writeAll(id);
+                try event_writer.writeAll("\",\"kind\":");
+                try event_writer.print("{d}", .{kind});
+                try event_writer.writeAll(",\"created_at\":");
+                try event_writer.print("{d}", .{created_at});
+                try event_writer.writeAll(",\"pubkey\":\"");
+                try event_writer.writeAll(pubkey);
+                try event_writer.writeAll("\",\"content\":");
+                try writeJsonString(event_writer, content);
+                try event_writer.writeAll(",\"sig\":\"");
+                try event_writer.writeAll(sig);
+                try event_writer.writeAll("\",\"tags\":");
+                try event_writer.writeAll(tagsj);
+                try event_writer.writeAll("}]");
+                try messages.append(self.context.allocator, try buf.toOwnedSlice(self.context.allocator));
             }
         }
-        var res = try stmt.execute();
-        defer res.deinit();
 
-        while (try res.next()) |row| {
-            if (row.values.len != 7) break;
-
-            const id = row.get([]u8, 0);
-            const pubkey = row.get([]u8, 1);
-            const created_at = row.get(i32, 2);
-            const kind = row.get(i32, 3);
-            const tagsj = row.get([]u8, 4);
-            const content = row.get([]u8, 5);
-            const sig = row.get([]u8, 6);
-
-            var buf: std.ArrayList(u8) = .{};
-            defer buf.deinit(self.context.allocator);
-            var event_writer = buf.writer(self.context.allocator);
-            try event_writer.writeAll("[\"EVENT\",\"");
-            try event_writer.writeAll(sub);
-            try event_writer.writeAll("\",{\"id\":\"");
-            try event_writer.writeAll(id);
-            try event_writer.writeAll("\",\"kind\":");
-            try event_writer.print("{d}", .{kind});
-            try event_writer.writeAll(",\"created_at\":");
-            try event_writer.print("{d}", .{created_at});
-            try event_writer.writeAll(",\"pubkey\":\"");
-            try event_writer.writeAll(pubkey);
-            try event_writer.writeAll("\",\"content\":");
-            try writeJsonString(event_writer, content);
-            try event_writer.writeAll(",\"sig\":\"");
-            try event_writer.writeAll(sig);
-            try event_writer.writeAll("\",\"tags\":");
-            try event_writer.writeAll(tagsj);
-            try event_writer.writeAll("}]");
-            try self.conn.write(buf.items);
+        // DB connection released — now write to client
+        for (messages.items) |msg| {
+            try self.conn.write(msg);
         }
 
         var buf: std.ArrayList(u8) = .{};
