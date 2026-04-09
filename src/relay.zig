@@ -456,7 +456,7 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
 
     // Execute query
     var stmt = try pg.Stmt.init(db, .{});
-    defer stmt.deinit();
+    errdefer stmt.deinit();
 
     try stmt.prepare(sql.items, null);
 
@@ -671,7 +671,7 @@ pub const Handler = struct {
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
-        defer stmt.deinit();
+        errdefer stmt.deinit();
 
         try stmt.prepare(sql, null);
         for (params.items) |param| {
@@ -690,7 +690,7 @@ pub const Handler = struct {
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
-        defer stmt.deinit();
+        errdefer stmt.deinit();
 
         try stmt.prepare("delete from event where kind = $1 and pubkey = $2", null);
         try stmt.bind(kind);
@@ -730,7 +730,7 @@ pub const Handler = struct {
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
-        defer stmt.deinit();
+        errdefer stmt.deinit();
 
         try stmt.prepare(sql, null);
         for (params.items) |param| {
