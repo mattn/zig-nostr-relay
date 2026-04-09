@@ -909,13 +909,15 @@ pub const Handler = struct {
 
             const tagsj = try make_tagsj(self.context.allocator, ev);
             defer self.context.allocator.free(tagsj);
-            const db = try self.context.pool.acquire();
-            defer self.context.pool.release(db);
-            _ = db.exec(
-                \\insert into event (id, pubkey, created_at, kind, tags, content, sig) values ($1, $2, $3, $4, $5, $6, $7)
-            , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, @constCast(tagsj), ev.content, ev.sig }) catch |err| {
-                logger.warn("Error inserting event: {s}", .{@errorName(err)});
-            };
+            {
+                const db = try self.context.pool.acquire();
+                defer self.context.pool.release(db);
+                _ = db.exec(
+                    \\insert into event (id, pubkey, created_at, kind, tags, content, sig) values ($1, $2, $3, $4, $5, $6, $7)
+                , .{ ev.id, ev.pubkey, ev.created_at, ev.kind, @constCast(tagsj), ev.content, ev.sig }) catch |err| {
+                    logger.warn("Error inserting event: {s}", .{@errorName(err)});
+                };
+            }
         }
 
         // Notify subscribers (copy list under mutex, then process outside)
