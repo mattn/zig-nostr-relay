@@ -456,7 +456,7 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
 
     // Execute query
     var stmt = try pg.Stmt.init(db, .{});
-    defer stmt.deinit();
+    errdefer stmt.deinit();
 
     try stmt.prepare(sql.items, null);
 
@@ -671,7 +671,7 @@ pub const Handler = struct {
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
-        defer stmt.deinit();
+        errdefer stmt.deinit();
 
         try stmt.prepare(sql, null);
         for (params.items) |param| {
@@ -690,7 +690,7 @@ pub const Handler = struct {
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
-        defer stmt.deinit();
+        errdefer stmt.deinit();
 
         try stmt.prepare("delete from event where kind = $1 and pubkey = $2", null);
         try stmt.bind(kind);
@@ -730,7 +730,7 @@ pub const Handler = struct {
         const db = try self.context.pool.acquire();
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
-        defer stmt.deinit();
+        errdefer stmt.deinit();
 
         try stmt.prepare(sql, null);
         for (params.items) |param| {
@@ -1152,11 +1152,23 @@ pub const Handler = struct {
         }
 
         {
-            const db = try self.context.pool.acquire();
+            const db = self.context.pool.acquire() catch |err| {
+                const stats = self.context.pool.stats();
+                logger.warn("REQ replay DB acquire failed for subscription={s}: {s} (size={d}, available={d}, missing={d}, in_use={d})", .{
+                    sub,
+                    @errorName(err),
+                    stats.size,
+                    stats.available,
+                    stats.missing,
+                    stats.in_use,
+                });
+                try self.conn.write("[\"NOTICE\", \"error: failed to load stored events\"]");
+                return;
+            };
             defer self.context.pool.release(db);
 
             var stmt = try pg.Stmt.init(db, .{});
-            defer stmt.deinit();
+            errdefer stmt.deinit();
 
             try stmt.prepare(sqlbuf.items, null);
             for (params.items) |param| {
