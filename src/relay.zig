@@ -12,6 +12,25 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const pg = @import("pg");
 const struct_env = @import("struct-env");
 
+/// Acquire a connection from the pool, retrying briefly when the pool is
+/// fully exhausted (all connections marked missing). The background
+/// reconnector restores connections one at a time; this gives it a small
+/// window to make progress before we surface the failure.
+fn acquirePool(pool: *pg.Pool) !*pg.Conn {
+    const max_attempts: usize = 10;
+    const delay_ns: u64 = 100 * std.time.ns_per_ms;
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        return pool.acquire() catch |err| {
+            if (err == error.PoolExhausted and attempt + 1 < max_attempts) {
+                std.Thread.sleep(delay_ns);
+                continue;
+            }
+            return err;
+        };
+    }
+}
+
 /// Write a JSON-encoded string (with surrounding quotes) to an ArrayList writer.
 /// Escapes \, ", and control characters as required by RFC 8259.
 fn writeJsonString(writer: anytype, s: []const u8) !void {
@@ -148,7 +167,7 @@ pub const Context = struct {
 };
 
 pub fn initDatabase(pool: *pg.Pool) !void {
-    const db = try pool.acquire();
+    const db = try acquirePool(pool);
     defer pool.release(db);
 
     _ = try db.exec(
@@ -256,7 +275,7 @@ pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket
         return;
     }
 
-    const db = try pool.acquire();
+    const db = try acquirePool(pool);
     defer pool.release(db);
 
     // Handle deletions based on event kind
@@ -391,7 +410,7 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
     }
 
     // Build SQL query
-    const db = try context.pool.acquire();
+    const db = try acquirePool(context.pool);
     defer context.pool.release(db);
 
     var sql: std.ArrayList(u8) = .{};
@@ -668,7 +687,7 @@ pub const Handler = struct {
         const sql = try std.fmt.allocPrint(self.context.allocator, "delete from event where id in ({s})", .{parambuf.items});
         defer self.context.allocator.free(sql);
 
-        const db = try self.context.pool.acquire();
+        const db = try acquirePool(self.context.pool);
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
         errdefer stmt.deinit();
@@ -687,7 +706,7 @@ pub const Handler = struct {
     }
 
     fn delete_record_by_kind_and_pubkey(self: *Handler, kind: i64, pubkey: []u8) !bool {
-        const db = try self.context.pool.acquire();
+        const db = try acquirePool(self.context.pool);
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
         errdefer stmt.deinit();
@@ -727,7 +746,7 @@ pub const Handler = struct {
         const sql = try std.fmt.allocPrint(self.context.allocator, "delete from event where kind = $1 and pubkey = $2 and id in ({s})", .{parambuf.items});
         defer self.context.allocator.free(sql);
 
-        const db = try self.context.pool.acquire();
+        const db = try acquirePool(self.context.pool);
         defer self.context.pool.release(db);
         var stmt = try pg.Stmt.init(db, .{});
         errdefer stmt.deinit();
@@ -910,7 +929,7 @@ pub const Handler = struct {
             const tagsj = try make_tagsj(self.context.allocator, ev);
             defer self.context.allocator.free(tagsj);
             {
-                const db = try self.context.pool.acquire();
+                const db = try acquirePool(self.context.pool);
                 defer self.context.pool.release(db);
                 _ = db.exec(
                     \\insert into event (id, pubkey, created_at, kind, tags, content, sig) values ($1, $2, $3, $4, $5, $6, $7)
@@ -1152,7 +1171,7 @@ pub const Handler = struct {
         }
 
         {
-            const db = self.context.pool.acquire() catch |err| {
+            const db = acquirePool(self.context.pool) catch |err| {
                 const stats = self.context.pool.stats();
                 logger.warn("REQ replay DB acquire failed for subscription={s}: {s} (size={d}, available={d}, missing={d}, in_use={d})", .{
                     sub,
