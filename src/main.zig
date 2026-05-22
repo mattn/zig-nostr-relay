@@ -490,6 +490,16 @@ pub fn main() !void {
     };
     relay_context = &context;
 
+    // Background DB heartbeat: periodically SELECT 1 on every idle
+    // connection so idle reapers (NAT/LB/pgbouncer) don't silently kill
+    // the whole pool during quiet periods.
+    const heartbeat_thread = try std.Thread.spawn(
+        .{},
+        relay.runHeartbeat,
+        .{ pool, &shutdown_flag, allocator },
+    );
+    defer heartbeat_thread.join();
+
     logger.info("Starting unified server (WebSocket + HTTP) on {s}:{d}", .{ env.relay_addr, env.relay_port });
 
     // Start custom TCP server that routes to WebSocket or HTTP

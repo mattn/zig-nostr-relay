@@ -12,18 +12,91 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const pg = @import("pg");
 const struct_env = @import("struct-env");
 
-/// Acquire a connection from the pool, retrying briefly when the pool is
-/// fully exhausted (all connections marked missing). The background
-/// reconnector restores connections one at a time; this gives it a small
-/// window to make progress before we surface the failure.
+/// Periodically run `SELECT 1` on every currently-idle connection in the
+/// pool. This keeps NAT / load-balancer / pgbouncer idle reapers from
+/// silently severing connections during quiet periods, which would
+/// otherwise cause a burst of failed acquires when traffic resumes (all
+/// connections discovered dead at the same time → pool marked fully
+/// missing → `PoolExhausted`).
+///
+/// Holds every idle connection at once during a cycle so that pg.zig's
+/// LIFO release order doesn't keep us pinging the same hot conn over and
+/// over. Cycle is short (one `SELECT 1` round-trip per conn).
+pub fn runHeartbeat(
+    pool: *pg.Pool,
+    shutdown: *std.atomic.Value(bool),
+    allocator: std.mem.Allocator,
+) void {
+    const interval_ns: u64 = 30 * std.time.ns_per_s;
+    while (true) {
+        sleepInterruptible(interval_ns, shutdown);
+        if (shutdown.load(.acquire)) return;
+        heartbeatCycle(pool, allocator) catch |err| {
+            logger.warn("DB heartbeat cycle failed: {s}", .{@errorName(err)});
+        };
+    }
+}
+
+fn sleepInterruptible(total_ns: u64, shutdown: *std.atomic.Value(bool)) void {
+    const chunk_ns: u64 = 500 * std.time.ns_per_ms;
+    var remaining: u64 = total_ns;
+    while (remaining > 0) {
+        if (shutdown.load(.acquire)) return;
+        const sleep_ns = @min(chunk_ns, remaining);
+        std.Thread.sleep(sleep_ns);
+        remaining -= sleep_ns;
+    }
+}
+
+fn heartbeatCycle(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
+    const idle = pool.stats().available;
+    if (idle == 0) return;
+
+    var held: std.ArrayList(*pg.Conn) = .{};
+    defer {
+        var i = held.items.len;
+        while (i > 0) {
+            i -= 1;
+            pool.release(held.items[i]);
+        }
+        held.deinit(allocator);
+    }
+
+    var n: usize = 0;
+    while (n < idle) : (n += 1) {
+        const conn = pool.acquire() catch |err| {
+            if (err == error.PoolExhausted or err == error.Timeout) break;
+            return err;
+        };
+        // On ping failure, release immediately. pg.zig's release will see
+        // a non-idle state and swap the connection for a fresh one (or
+        // mark it missing for the reconnector).
+        _ = conn.exec("SELECT 1", .{}) catch |err| {
+            logger.warn("DB heartbeat ping failed: {s}", .{@errorName(err)});
+            pool.release(conn);
+            continue;
+        };
+        try held.append(allocator, conn);
+    }
+}
+
+/// Acquire a connection from the pool, retrying when the pool is fully
+/// exhausted (all connections marked missing). The background reconnector
+/// in pg.zig restores connections serially with a 2s backoff between
+/// failures, so this loop must wait long enough for at least one
+/// connection to come back. Total budget is ~5s with exponential backoff.
 fn acquirePool(pool: *pg.Pool) !*pg.Conn {
-    const max_attempts: usize = 10;
-    const delay_ns: u64 = 100 * std.time.ns_per_ms;
-    var attempt: usize = 0;
-    while (true) : (attempt += 1) {
+    const max_total_ns: u64 = 5 * std.time.ns_per_s;
+    var delay_ns: u64 = 50 * std.time.ns_per_ms;
+    const max_delay_ns: u64 = 1 * std.time.ns_per_s;
+    var waited_ns: u64 = 0;
+    while (true) {
         return pool.acquire() catch |err| {
-            if (err == error.PoolExhausted and attempt + 1 < max_attempts) {
-                std.Thread.sleep(delay_ns);
+            if (err == error.PoolExhausted and waited_ns < max_total_ns) {
+                const sleep_ns = @min(delay_ns, max_total_ns - waited_ns);
+                std.Thread.sleep(sleep_ns);
+                waited_ns += sleep_ns;
+                delay_ns = @min(delay_ns * 2, max_delay_ns);
                 continue;
             }
             return err;
