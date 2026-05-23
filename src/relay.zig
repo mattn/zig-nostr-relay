@@ -62,6 +62,9 @@ fn heartbeatCycle(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
         held.deinit(allocator);
     }
 
+    var fail_count: usize = 0;
+    var first_logged = false;
+
     var n: usize = 0;
     while (n < idle) : (n += 1) {
         const conn = pool.acquire() catch |err| {
@@ -72,11 +75,28 @@ fn heartbeatCycle(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
         // a non-idle state and swap the connection for a fresh one (or
         // mark it missing for the reconnector).
         _ = conn.exec("SELECT 1", .{}) catch |err| {
-            logger.warn("DB heartbeat ping failed: {s}", .{@errorName(err)});
+            fail_count += 1;
+            if (!first_logged) {
+                first_logged = true;
+                if (conn.err) |pg_err| {
+                    logger.warn("DB heartbeat ping failed: {s} [{s} {s}] {s}", .{
+                        @errorName(err),
+                        pg_err.severity,
+                        pg_err.code,
+                        pg_err.message,
+                    });
+                } else {
+                    logger.warn("DB heartbeat ping failed: {s}", .{@errorName(err)});
+                }
+            }
             pool.release(conn);
             continue;
         };
         try held.append(allocator, conn);
+    }
+
+    if (fail_count > 1) {
+        logger.warn("DB heartbeat: {d} more connections failed the same cycle", .{fail_count - 1});
     }
 }
 
