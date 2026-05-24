@@ -461,6 +461,11 @@ pub fn main() !void {
     logger.info("Initializing PostgreSQL pool with: {s}", .{env.database_url});
     var pool = pg.Pool.initUri(allocator, try std.Uri.parse(env.database_url), .{
         .size = 32,
+        // Stagger connection births so all 32 don't share a death time
+        // (e.g. server-side idle_session_timeout firing simultaneously).
+        // The rest are lazily opened by the background Reconnector at
+        // 2s intervals.
+        .connect_on_init_count = 4,
     }) catch |err| {
         logger.err("Failed to initialize pool: {s}", .{@errorName(err)});
         return;

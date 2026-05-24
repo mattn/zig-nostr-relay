@@ -27,8 +27,13 @@ pub fn runHeartbeat(
     shutdown: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
 ) void {
-    const interval_ns: u64 = 30 * std.time.ns_per_s;
+    const healthy_interval_ns: u64 = 30 * std.time.ns_per_s;
+    const degraded_interval_ns: u64 = 15 * std.time.ns_per_s;
     while (true) {
+        const interval_ns = if (pool.stats().missing > 0)
+            degraded_interval_ns
+        else
+            healthy_interval_ns;
         sleepInterruptible(interval_ns, shutdown);
         if (shutdown.load(.acquire)) return;
         heartbeatCycle(pool, allocator) catch |err| {
@@ -49,7 +54,20 @@ fn sleepInterruptible(total_ns: u64, shutdown: *std.atomic.Value(bool)) void {
 }
 
 fn heartbeatCycle(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
-    const idle = pool.stats().available;
+    const s = pool.stats();
+
+    // Surface the pool's recovery progress. When pg.zig's background
+    // Reconnector retries fail, they are logged via pg.zig's own logger
+    // with `log_failure=false` — i.e. completely silent. Logging stats
+    // every heartbeat lets us see whether `missing` is shrinking (=>
+    // Reconnector working, just slow) or stuck (=> server unreachable).
+    if (s.missing > 0) {
+        logger.warn("DB pool degraded: size={d} available={d} missing={d} in_use={d}", .{
+            s.size, s.available, s.missing, s.in_use,
+        });
+    }
+
+    const idle = s.available;
     if (idle == 0) return;
 
     var held: std.ArrayList(*pg.Conn) = .{};
