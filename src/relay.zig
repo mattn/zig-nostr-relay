@@ -26,6 +26,7 @@ pub fn runHeartbeat(
     pool: *pg.Pool,
     shutdown: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
+    database_url: []const u8,
 ) void {
     const healthy_interval_ns: u64 = 30 * std.time.ns_per_s;
     const degraded_interval_ns: u64 = 15 * std.time.ns_per_s;
@@ -36,7 +37,7 @@ pub fn runHeartbeat(
             healthy_interval_ns;
         sleepInterruptible(interval_ns, shutdown);
         if (shutdown.load(.acquire)) return;
-        heartbeatCycle(pool, allocator) catch |err| {
+        heartbeatCycle(pool, allocator, database_url) catch |err| {
             logger.warn("DB heartbeat cycle failed: {s}", .{@errorName(err)});
         };
     }
@@ -53,7 +54,7 @@ fn sleepInterruptible(total_ns: u64, shutdown: *std.atomic.Value(bool)) void {
     }
 }
 
-fn heartbeatCycle(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
+fn heartbeatCycle(pool: *pg.Pool, allocator: std.mem.Allocator, database_url: []const u8) !void {
     const s = pool.stats();
 
     // Surface the pool's recovery progress. When pg.zig's background
@@ -65,6 +66,7 @@ fn heartbeatCycle(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
         logger.warn("DB pool degraded: size={d} available={d} missing={d} in_use={d}", .{
             s.size, s.available, s.missing, s.in_use,
         });
+        probeFreshConnection(allocator, database_url);
     }
 
     const idle = s.available;
@@ -116,6 +118,35 @@ fn heartbeatCycle(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
     if (fail_count > 1) {
         logger.warn("DB heartbeat: {d} more connections failed the same cycle", .{fail_count - 1});
     }
+}
+
+/// Open a brand-new connection outside the pool to surface why the
+/// Reconnector keeps failing. pg.zig's Reconnector calls
+/// `newConnection(pool, false)`, which swallows the underlying error
+/// entirely — without this probe we have no idea whether the server is
+/// refusing TCP, failing TLS, rejecting auth, or returning a Postgres
+/// FATAL.
+fn probeFreshConnection(allocator: std.mem.Allocator, database_url: []const u8) void {
+    const uri = std.Uri.parse(database_url) catch |err| {
+        logger.warn("DB probe: bad DATABASE_URL: {s}", .{@errorName(err)});
+        return;
+    };
+    var conn = pg.Conn.openAndAuthUri(allocator, uri) catch |err| {
+        logger.warn("DB probe failed to open: {s}", .{@errorName(err)});
+        return;
+    };
+    defer conn.deinit();
+    _ = conn.exec("SELECT 1", .{}) catch |err| {
+        if (conn.err) |pg_err| {
+            logger.warn("DB probe SELECT 1 failed: {s} [{s} {s}] {s}", .{
+                @errorName(err), pg_err.severity, pg_err.code, pg_err.message,
+            });
+        } else {
+            logger.warn("DB probe SELECT 1 failed: {s}", .{@errorName(err)});
+        }
+        return;
+    };
+    logger.info("DB probe ok: server reachable but pool Reconnector stuck", .{});
 }
 
 /// Acquire a connection from the pool, retrying when the pool is fully
@@ -604,13 +635,13 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
         var response: std.ArrayList(u8) = .{};
         defer response.deinit(allocator);
 
-        const id = row.get([]u8, 0);
-        const pubkey = row.get([]u8, 1);
-        const created_at = row.get(i32, 2);
-        const kind = row.get(i32, 3);
-        const tags = row.get([]u8, 4);
-        const content = row.get([]u8, 5);
-        const sig = row.get([]u8, 6);
+        const id = try row.get([]u8, 0);
+        const pubkey = try row.get([]u8, 1);
+        const created_at = try row.get(i32, 2);
+        const kind = try row.get(i32, 3);
+        const tags = try row.get([]u8, 4);
+        const content = try row.get([]u8, 5);
+        const sig = try row.get([]u8, 6);
 
         try response.writer(allocator).print("[\"EVENT\",\"{s}\",{{\"id\":\"{s}\",\"pubkey\":\"{s}\",\"created_at\":{},\"kind\":{},\"tags\":{s},\"content\":", .{ sub_id.string, id, pubkey, created_at, kind, tags });
         try writeJsonString(response.writer(allocator), content);
@@ -1313,13 +1344,13 @@ pub const Handler = struct {
             while (try res.next()) |row| {
                 if (row.values.len != 7) break;
 
-                const id = row.get([]u8, 0);
-                const pubkey = row.get([]u8, 1);
-                const created_at = row.get(i32, 2);
-                const kind = row.get(i32, 3);
-                const tagsj = row.get([]u8, 4);
-                const content = row.get([]u8, 5);
-                const sig = row.get([]u8, 6);
+                const id = try row.get([]u8, 0);
+                const pubkey = try row.get([]u8, 1);
+                const created_at = try row.get(i32, 2);
+                const kind = try row.get(i32, 3);
+                const tagsj = try row.get([]u8, 4);
+                const content = try row.get([]u8, 5);
+                const sig = try row.get([]u8, 6);
 
                 var buf: std.ArrayList(u8) = .{};
                 errdefer buf.deinit(self.context.allocator);

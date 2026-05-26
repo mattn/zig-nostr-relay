@@ -21,8 +21,8 @@
             .hash = "122006b3387ad84a51b68431bbcc1bd4c48c548e8ec34a36766c899a1c4dfa83419b",
         },
         .pg = .{
-            .url = "https://github.com/karlseguin/pg.zig/archive/f8d4892387fbad2abdf775783e101e50a7114335.tar.gz",
-            .hash = "1220ff40066b3e134d106a6751947f2c490a4f8d14adade9fb8c97f0d30046f61914",
+            .url = "https://github.com/karlseguin/pg.zig/archive/78d52e52e7baabb5873df1a065d90a34fb174804.tar.gz",
+            .hash = "pg-0.0.0-Wp_7gU5zBgA4Ngj0opG4QGWPBjUzVZ8WT07s_uu64cC1",
         },
         .struct_env = .{
             .url = "https://github.com/Hanaasagi/struct-env/archive/4934ca86f3fcbc0500cc4ee65255943a2fa479e4.tar.gz",

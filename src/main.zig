@@ -496,7 +496,7 @@ pub fn main() !void {
     const heartbeat_thread = try std.Thread.spawn(
         .{},
         relay.runHeartbeat,
-        .{ pool, &shutdown_flag, allocator },
+        .{ pool, &shutdown_flag, allocator, env.database_url },
     );
     defer heartbeat_thread.join();
 
