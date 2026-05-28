@@ -12,6 +12,109 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const pg = @import("pg");
 const struct_env = @import("struct-env");
 
+/// Wraps a pg.Pool created from a URI, owning the parsed connection
+/// strings so they outlive the pool.
+///
+/// pg.zig's `Pool.initUri` (commit 78d52e5) has a use-after-free: it
+/// allocates host/username/password/database into a parse-time arena,
+/// then `defer po.deinit()`s that arena before storing the opts in the
+/// pool. `Pool.init` only shallow-copies the opts, so the pool retains
+/// slices into freed memory. Once the underlying memory gets reused by
+/// later allocations, the background Reconnector's silent
+/// `newConnection(pool, false)` permanently fails to re-auth and the
+/// pool sits at `missing == size` forever — server reachable, but no
+/// in-pool connection can be restored. We parse the URI ourselves,
+/// dupe every string into an arena that lives as long as the pool,
+/// and call `Pool.init` directly.
+pub const OwnedPool = struct {
+    pool: *pg.Pool,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *OwnedPool) void {
+        // Stop the pool first — its Reconnector thread reads from the
+        // strings in `arena` — then free the strings.
+        self.pool.deinit();
+        self.arena.deinit();
+    }
+};
+
+pub fn openPoolFromUri(
+    allocator: std.mem.Allocator,
+    database_url: []const u8,
+    size: u16,
+) !OwnedPool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const aa = arena.allocator();
+
+    const uri = try std.Uri.parse(database_url);
+    if (!std.mem.eql(u8, uri.scheme, "postgresql") and !std.mem.eql(u8, uri.scheme, "postgres")) {
+        return error.InvalidUriScheme;
+    }
+
+    var tls: pg.Conn.Opts.TLS = .off;
+    var tcp_user_timeout: ?u32 = null;
+    if (uri.query) |qry| {
+        const query_string = try qry.toRawMaybeAlloc(aa);
+        var it = std.mem.splitScalar(u8, query_string, '&');
+        while (it.next()) |param| {
+            var it2 = std.mem.splitScalar(u8, param, '=');
+            const key = it2.first();
+            const val = it2.rest();
+            if (std.mem.eql(u8, key, "tcp_user_timeout")) {
+                tcp_user_timeout = try std.fmt.parseInt(u32, val, 10);
+            } else if (std.mem.eql(u8, key, "sslmode")) {
+                if (std.mem.eql(u8, val, "require")) {
+                    tls = .require;
+                } else if (std.mem.eql(u8, val, "verify-full")) {
+                    tls = .{ .verify_full = null };
+                } else if (!std.mem.eql(u8, val, "disable")) {
+                    return error.UnsupportedSSLModeValue;
+                }
+            } else {
+                return error.UnsupportedConnectionParam;
+            }
+        }
+    }
+
+    // Always dupe so the pool never aliases the caller's URL buffer.
+    const path_raw = try uri.path.toRawMaybeAlloc(aa);
+    const path = std.mem.trimLeft(u8, path_raw, "/");
+    const host: ?[]const u8 = if (uri.host) |h|
+        try aa.dupe(u8, try h.toRawMaybeAlloc(aa))
+    else
+        null;
+    const username = try aa.dupe(u8, if (uri.user) |u|
+        try u.toRawMaybeAlloc(aa)
+    else
+        "postgres");
+    const password: ?[]const u8 = if (uri.password) |p|
+        try aa.dupe(u8, try p.toRawMaybeAlloc(aa))
+    else
+        null;
+    const database: ?[]const u8 = if (path.len == 0)
+        null
+    else
+        try aa.dupe(u8, path);
+
+    const pool = try pg.Pool.init(allocator, .{
+        .size = size,
+        .auth = .{
+            .username = username,
+            .password = password,
+            .database = database,
+            .timeout = tcp_user_timeout orelse 10_000,
+        },
+        .connect = .{
+            .tls = tls,
+            .port = uri.port,
+            .host = host,
+        },
+    });
+
+    return .{ .pool = pool, .arena = arena };
+}
+
 /// Periodically run `SELECT 1` on every currently-idle connection in the
 /// pool. This keeps NAT / load-balancer / pgbouncer idle reapers from
 /// silently severing connections during quiet periods, which would

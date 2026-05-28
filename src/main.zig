@@ -4,7 +4,6 @@ const Conn = websocket.Conn;
 const Message = websocket.Message;
 const Handshake = websocket.Handshake;
 
-const pg = @import("pg");
 const struct_env = @import("struct-env");
 const relay = @import("relay.zig");
 const logger = @import("logger.zig");
@@ -459,13 +458,12 @@ pub fn main() !void {
     }
 
     logger.info("Initializing PostgreSQL pool with: {s}", .{env.database_url});
-    var pool = pg.Pool.initUri(allocator, try std.Uri.parse(env.database_url), .{
-        .size = 4,
-    }) catch |err| {
+    var pool_handle = relay.openPoolFromUri(allocator, env.database_url, 4) catch |err| {
         logger.err("Failed to initialize pool: {s}", .{@errorName(err)});
         return;
     };
-    defer pool.deinit();
+    defer pool_handle.deinit();
+    const pool = pool_handle.pool;
     logger.info("Pool initialized", .{});
 
     // Initialize database schema
