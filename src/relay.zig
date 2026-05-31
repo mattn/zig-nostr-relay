@@ -1555,21 +1555,11 @@ pub const Handler = struct {
         var arena = std.heap.ArenaAllocator.init(self.context.allocator);
         defer arena.deinit();
 
-        // Additional validation: check balanced brackets
-        var bracket_count: i32 = 0;
-        for (data) |c| {
-            if (c == '[' or c == '{') bracket_count += 1;
-            if (c == ']' or c == '}') bracket_count -= 1;
-            if (bracket_count < 0) {
-                try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
-                return;
-            }
-        }
-        if (bracket_count != 0) {
-            try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
-            return;
-        }
-
+        // NOTE: no manual bracket-balance scan here. A naive byte-level count
+        // of [ { ] } does not skip JSON string contents, so any event whose
+        // content/tags carry unbalanced brackets in a string (e.g. a blurhash
+        // like "UJEo[Ht8...NM{00M{...") would be wrongly rejected as "invalid
+        // request". std.json.parseFromSlice below already validates structure.
         const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), data, .{
             .allocate = .alloc_always,
             .max_value_len = 1024 * 1024, // 1MB max
