@@ -18,6 +18,7 @@ const Config = struct {
     relay_pubkey: []const u8 = "",
     relay_contact: []const u8 = "",
     relay_icon: []const u8 = "",
+    relay_countries: []const []const u8 = &.{"JP"},
 };
 
 var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -266,6 +267,7 @@ const Nip11Response = struct {
     supported_nips: [10]u32 = [_]u32{ 1, 2, 4, 9, 11, 20, 22, 33, 40, 42 },
     software: []const u8 = "https://github.com/mattn/zig-nostr-relay",
     version: []const u8 = "0.1.0",
+    relay_countries: []const []const u8,
 };
 
 fn serveNip11(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
@@ -276,6 +278,7 @@ fn serveNip11(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
         .contact = relay_context.config.relay_contact,
         .url = if (relay_context.config.relay_url.len > 0) relay_context.config.relay_url else null,
         .icon = if (relay_context.config.relay_icon.len > 0) relay_context.config.relay_icon else null,
+        .relay_countries = relay_context.config.relay_countries,
     };
 
     var json_buf = std.ArrayList(u8){};
@@ -484,6 +487,7 @@ pub fn main() !void {
             .relay_pubkey = env.relay_pubkey,
             .relay_contact = env.relay_contact,
             .relay_icon = env.relay_icon,
+            .relay_countries = env.relay_countries,
         },
     };
     relay_context = &context;

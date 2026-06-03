@@ -400,6 +400,7 @@ pub const Config = struct {
     relay_pubkey: []const u8,
     relay_contact: []const u8,
     relay_icon: []const u8,
+    relay_countries: []const []const u8,
 };
 
 pub const Context = struct {
