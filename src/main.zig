@@ -29,7 +29,7 @@ fn signalHandler(_: i32) callconv(.c) void {
 }
 
 // Custom connection handler that routes to WebSocket or HTTP
-fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
+fn handleConnection(stream: std.net.Stream, peer: std.net.Address, allocator: std.mem.Allocator) void {
     // Read the initial request
     var buf: [4096]u8 = undefined;
     const bytes_read = stream.read(&buf) catch {
@@ -48,7 +48,7 @@ fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
         std.mem.indexOf(u8, request, "upgrade: websocket") != null;
 
     if (is_websocket) {
-        handleWebSocketUpgrade(stream, request, allocator) catch |err| {
+        handleWebSocketUpgrade(stream, peer, request, allocator) catch |err| {
             // Silently ignore WebSocket upgrade errors to avoid std.debug.print in multi-threaded context
             logger.debug("WebSocket error: {s}", .{@errorName(err)});
             stream.close();
@@ -62,7 +62,30 @@ fn handleConnection(stream: std.net.Stream, allocator: std.mem.Allocator) void {
     }
 }
 
-fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
+/// Pull the real client IP from common reverse-proxy headers
+/// (cf-connecting-ip / x-forwarded-for / x-real-ip), falling back to
+/// the TCP peer address. Returned slice is owned by `allocator`.
+fn extractClientIp(allocator: std.mem.Allocator, request: []const u8, lower_request: []const u8, peer: std.net.Address) ![]u8 {
+    const headers = [_][]const u8{
+        "cf-connecting-ip:",
+        "x-forwarded-for:",
+        "x-real-ip:",
+    };
+    for (headers) |h| {
+        const pos = std.mem.indexOf(u8, lower_request, h) orelse continue;
+        const start = pos + h.len;
+        const end = std.mem.indexOfPos(u8, request, start, "\r\n") orelse
+            std.mem.indexOfPos(u8, request, start, "\n") orelse continue;
+        var value = std.mem.trim(u8, request[start..end], &std.ascii.whitespace);
+        if (std.mem.indexOfScalar(u8, value, ',')) |idx| {
+            value = std.mem.trim(u8, value[0..idx], &std.ascii.whitespace);
+        }
+        if (value.len > 0) return try allocator.dupe(u8, value);
+    }
+    return try std.fmt.allocPrint(allocator, "{f}", .{peer});
+}
+
+fn handleWebSocketUpgrade(stream: std.net.Stream, peer: std.net.Address, request: []const u8, allocator: std.mem.Allocator) !void {
     // Extract Sec-WebSocket-Key (case insensitive)
     const lower_request = try allocator.alloc(u8, request.len);
     defer allocator.free(lower_request);
@@ -70,6 +93,9 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     for (request, 0..) |c, i| {
         lower_request[i] = std.ascii.toLower(c);
     }
+
+    const client_ip = try extractClientIp(allocator, request, lower_request, peer);
+    defer allocator.free(client_ip);
 
     const key_header = "sec-websocket-key:";
     const key_start_lower = std.mem.indexOf(u8, lower_request, key_header) orelse return error.NoWebSocketKey;
@@ -106,7 +132,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
         ._closed = false,
         .started = @intCast(std.time.timestamp()),
         .stream = stream,
-        .address = std.net.Address.initIp4([_]u8{ 127, 0, 0, 1 }, 7447),
+        .address = peer,
         .lock = std.Thread.Mutex{},
         .compression = null,
     };
@@ -115,7 +141,10 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     const handler = relay.Handler{
         .conn = conn,
         .context = relay_context,
+        .client_ip = client_ip,
     };
+
+    logger.info("[{s}] Client connected", .{client_ip});
 
     // Handle WebSocket messages
     // Use larger reader buffer to handle bigger frames
@@ -160,7 +189,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
                     if (message.data.len > 0) {
                         logger.debug("Received: {s}", .{message.data});
                         @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
-                            logger.warn("clientMessage error: {s}", .{@errorName(err)});
+                            logger.warn("[{s}] clientMessage error: {s}", .{ client_ip, @errorName(err) });
                             // If connection is broken, exit gracefully
                             if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break :main_loop;
                             // Continue processing for other errors
@@ -200,6 +229,8 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, request: []const u8, allocator
     while (@atomicLoad(u32, &relay_context.broadcast_count, .acquire) > 0) {
         std.atomic.spinLoopHint();
     }
+
+    logger.info("[{s}] Client disconnected", .{client_ip});
 }
 
 fn handleHttpRequest(stream: std.net.Stream, request: []const u8, allocator: std.mem.Allocator) !void {
@@ -522,7 +553,7 @@ pub fn main() !void {
             if (err == error.SocketTimeout) continue;
             continue;
         };
-        const thread = std.Thread.spawn(.{}, handleConnection, .{ client.stream, allocator }) catch {
+        const thread = std.Thread.spawn(.{}, handleConnection, .{ client.stream, client.address, allocator }) catch {
             client.stream.close();
             continue;
         };

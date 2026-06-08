@@ -840,6 +840,7 @@ pub fn verifyEvent(allocator: std.mem.Allocator, ev: Event) !bool {
 pub const Handler = struct {
     conn: *Conn,
     context: *Context,
+    client_ip: []const u8 = "-",
 
     pub fn init(h: *const Handshake, conn: *Conn, context: *Context) !Handler {
         _ = h;
@@ -1134,7 +1135,7 @@ pub const Handler = struct {
         const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, value.array.items[1], .{});
         const ev = parsedEvent.value;
 
-        logger.info("Received EVENT: id={s}, kind={d}, pubkey={s}", .{ ev.id[0..16], ev.kind, ev.pubkey[0..16] });
+        logger.info("[{s}] Received EVENT: id={s}, kind={d}, pubkey={s}", .{ self.client_ip, ev.id[0..16], ev.kind, ev.pubkey[0..16] });
 
         const verified = verify_event(self.context.allocator, ev) catch |err| {
             logger.warn("Event verification failed: {s}", .{@errorName(err)});
@@ -1267,7 +1268,7 @@ pub const Handler = struct {
         const sub = value.array.items[1].string;
 
         const filters = try make_filter(self.context.allocator, value.array);
-        logger.info("Received REQ: subscription={s}, filters={d}", .{ sub, filters.items.len });
+        logger.info("[{s}] Received REQ: subscription={s}, filters={d}", .{ self.client_ip, sub, filters.items.len });
         const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters);
 
         // Add subscriber with mutex protection
