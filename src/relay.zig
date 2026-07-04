@@ -484,6 +484,84 @@ fn verify(public_key: [32]u8, msg: [32]u8, signature: [64]u8) !bool {
     return true;
 }
 
+// NIP-26: Delegated Event Signing
+// https://github.com/nostr-protocol/nips/blob/master/26.md
+// An event may carry a tag ["delegation", <delegator pubkey>, <conditions>, <sig>]
+// where <sig> is a BIP-340 signature by the delegator over
+// sha256("nostr:delegation:<delegatee pubkey>:<conditions>").
+fn validateDelegation(ev: Event) bool {
+    var delegation_tag: ?[][]u8 = null;
+    for (ev.tags) |tag| {
+        if (tag.len >= 4 and std.mem.eql(u8, tag[0], "delegation")) {
+            delegation_tag = tag;
+            break;
+        }
+    }
+
+    // No delegation tag: accept as before
+    const tag = delegation_tag orelse return true;
+    if (tag.len != 4) return false;
+
+    const delegator_pubkey = tag[1];
+    const conditions = tag[2];
+    const signature = tag[3];
+
+    if (delegator_pubkey.len == 0 or conditions.len == 0 or signature.len == 0) return false;
+
+    if (delegator_pubkey.len != 64) return false;
+    var bytes_pk: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes_pk, delegator_pubkey) catch return false;
+
+    if (!validateDelegationConditions(ev, conditions)) return false;
+
+    if (!verifyDelegationSignature(ev.pubkey, delegator_pubkey, conditions, signature)) return false;
+
+    return true;
+}
+
+// Conditions are an &-separated query string: kind=<int> (event kind must
+// match one of the listed kinds), created_at<<timestamp> and
+// created_at><timestamp> (event timestamp must fall inside the delegated
+// window). Unknown fields are ignored.
+fn validateDelegationConditions(ev: Event, conditions: []const u8) bool {
+    var kind_allowed = false;
+    var created_at_valid = true;
+
+    var it = std.mem.splitScalar(u8, conditions, '&');
+    while (it.next()) |condition| {
+        if (std.mem.startsWith(u8, condition, "kind=")) {
+            const allowed_kind = std.fmt.parseInt(i32, condition["kind=".len..], 10) catch continue;
+            if (ev.kind == allowed_kind) kind_allowed = true;
+        } else if (std.mem.startsWith(u8, condition, "created_at<")) {
+            const max_time = std.fmt.parseInt(i64, condition["created_at<".len..], 10) catch continue;
+            if (ev.created_at >= max_time) created_at_valid = false;
+        } else if (std.mem.startsWith(u8, condition, "created_at>")) {
+            const min_time = std.fmt.parseInt(i64, condition["created_at>".len..], 10) catch continue;
+            if (ev.created_at <= min_time) created_at_valid = false;
+        }
+    }
+
+    return kind_allowed and created_at_valid;
+}
+
+fn verifyDelegationSignature(delegatee_pubkey: []const u8, delegator_pubkey: []const u8, conditions: []const u8, signature: []const u8) bool {
+    if (signature.len != 128) return false;
+    var bytes_sig: [64]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes_sig, signature) catch return false;
+    var bytes_pk: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes_pk, delegator_pubkey) catch return false;
+
+    var msgbuf: [32]u8 = undefined;
+    var sha256 = Sha256.init(.{});
+    sha256.update("nostr:delegation:");
+    sha256.update(delegatee_pubkey);
+    sha256.update(":");
+    sha256.update(conditions);
+    sha256.final(&msgbuf);
+
+    return verify(bytes_pk, msgbuf, bytes_sig) catch false;
+}
+
 fn make_tagsj(allocator: std.mem.Allocator, ev: Event) ![]const u8 {
     var result: std.ArrayList(u8) = .{};
     errdefer result.deinit(allocator);
@@ -518,6 +596,14 @@ pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket
         logger.warn("Event has invalid signature", .{});
         const notice = "[\"NOTICE\",\"error: invalid signature\"]";
         _ = std.posix.write(socket, notice) catch {};
+        return;
+    }
+
+    if (!validateDelegation(ev)) {
+        logger.warn("Event has invalid delegation", .{});
+        var response: [512]u8 = undefined;
+        const response_len = try std.fmt.bufPrint(&response, "[\"OK\",\"{s}\",false,\"invalid: delegation verification failed\"]", .{ev.id});
+        _ = std.posix.write(socket, response_len) catch {};
         return;
     }
 
@@ -1147,6 +1233,18 @@ pub const Handler = struct {
         }
         logger.debug("Event signature verified", .{});
 
+        if (!validateDelegation(ev)) {
+            logger.warn("Event has invalid delegation", .{});
+            var ng_buf: std.ArrayList(u8) = .{};
+            defer ng_buf.deinit(self.context.allocator);
+            var ng_writer = ng_buf.writer(self.context.allocator);
+            try ng_writer.writeAll("[\"OK\",\"");
+            try ng_writer.writeAll(ev.id);
+            try ng_writer.writeAll("\",false,\"invalid: delegation verification failed\"]");
+            try self.conn.write(ng_buf.items);
+            return;
+        }
+
         if (ev.kind == 5) {
             for (ev.tags) |tag| {
                 if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) {
@@ -1613,3 +1711,116 @@ pub const Handler = struct {
         logger.debug("Connection closed, cleaned up subscriptions", .{});
     }
 };
+
+// Test-only BIP-340 signer (deterministic nonce per the BIP, with an
+// all-zero aux) used to produce delegation signatures for the tests below.
+fn testSchnorrSign(secret: [32]u8, msg: [32]u8) ![64]u8 {
+    var d = try Scalar.fromBytes(secret, .big);
+    const P = try Secp256k1.basePoint.mul(d.toBytes(.big), .big);
+    if (P.affineCoordinates().y.isOdd()) {
+        d = d.neg();
+    }
+    const px = P.affineCoordinates().x.toBytes(.big);
+
+    const aux = [_]u8{0} ** 32;
+    const aux_hash = taggedHash("BIP0340/aux", &aux);
+    var t = d.toBytes(.big);
+    for (&t, aux_hash) |*b, a| b.* ^= a;
+
+    var nonce_input: [96]u8 = undefined;
+    @memcpy(nonce_input[0..32], &t);
+    @memcpy(nonce_input[32..64], &px);
+    @memcpy(nonce_input[64..96], &msg);
+    var k_wide = [_]u8{0} ** 64;
+    const nonce_hash = taggedHash("BIP0340/nonce", &nonce_input);
+    @memcpy(k_wide[32..64], &nonce_hash);
+    var k = Scalar.fromBytes64(k_wide, .big);
+    if (k.isZero()) return error.IdentityElement;
+
+    const R = try Secp256k1.basePoint.mul(k.toBytes(.big), .big);
+    if (R.affineCoordinates().y.isOdd()) {
+        k = k.neg();
+    }
+    const rx = R.affineCoordinates().x.toBytes(.big);
+
+    var challenge_input: [96]u8 = undefined;
+    @memcpy(challenge_input[0..32], &rx);
+    @memcpy(challenge_input[32..64], &px);
+    @memcpy(challenge_input[64..96], &msg);
+    var e_wide = [_]u8{0} ** 64;
+    const challenge_hash = taggedHash("BIP0340/challenge", &challenge_input);
+    @memcpy(e_wide[32..64], &challenge_hash);
+    const e = Scalar.fromBytes64(e_wide, .big);
+
+    var sig: [64]u8 = undefined;
+    @memcpy(sig[0..32], &rx);
+    @memcpy(sig[32..64], &k.add(e.mul(d)).toBytes(.big));
+    return sig;
+}
+
+fn testXOnlyPubkey(secret: [32]u8) ![64]u8 {
+    const P = try Secp256k1.basePoint.mul(secret, .big);
+    return std.fmt.bytesToHex(P.affineCoordinates().x.toBytes(.big), .lower);
+}
+
+test "validateDelegation accepts events without a delegation tag" {
+    var pubkey = [_]u8{'0'} ** 64;
+    var no_tags = [_][][]u8{};
+    const ev = Event{
+        .id = @constCast(""),
+        .kind = 1,
+        .created_at = 100,
+        .pubkey = &pubkey,
+        .content = @constCast(""),
+        .sig = @constCast(""),
+        .tags = &no_tags,
+    };
+    try std.testing.expect(validateDelegation(ev));
+}
+
+test "validateDelegation accepts valid delegation and rejects forged signature" {
+    const delegatee_secret = [_]u8{0x11} ** 32;
+    const delegator_secret = [_]u8{0x22} ** 32;
+
+    var delegatee_pubkey = try testXOnlyPubkey(delegatee_secret);
+    var delegator_pubkey = try testXOnlyPubkey(delegator_secret);
+    const conditions = "kind=1&created_at>1&created_at<4102444800";
+
+    // Sign sha256("nostr:delegation:<delegatee>:<conditions>") with the delegator key
+    var msgbuf: [32]u8 = undefined;
+    var sha256 = Sha256.init(.{});
+    sha256.update("nostr:delegation:");
+    sha256.update(&delegatee_pubkey);
+    sha256.update(":");
+    sha256.update(conditions);
+    sha256.final(&msgbuf);
+    var signature = std.fmt.bytesToHex(try testSchnorrSign(delegator_secret, msgbuf), .lower);
+
+    var tag = [_][]u8{ @constCast("delegation"), &delegator_pubkey, @constCast(conditions), &signature };
+    var tags = [_][][]u8{&tag};
+    var ev = Event{
+        .id = @constCast(""),
+        .kind = 1,
+        .created_at = 100,
+        .pubkey = &delegatee_pubkey,
+        .content = @constCast(""),
+        .sig = @constCast(""),
+        .tags = &tags,
+    };
+    try std.testing.expect(validateDelegation(ev));
+
+    // Event kind not covered by the delegated conditions
+    ev.kind = 2;
+    try std.testing.expect(!validateDelegation(ev));
+    ev.kind = 1;
+
+    // Event timestamp outside the delegated window
+    ev.created_at = 1;
+    try std.testing.expect(!validateDelegation(ev));
+    ev.created_at = 100;
+
+    // Forged signature
+    var forged = [_]u8{'3'} ** 128;
+    tag[3] = &forged;
+    try std.testing.expect(!validateDelegation(ev));
+}

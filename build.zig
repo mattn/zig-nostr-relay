@@ -36,6 +36,15 @@ pub fn build(b: *std.Build) void {
     pg_module.addIncludePath(.{ .cwd_relative = "/usr/include" });
     pg_module.link_libc = true;
 
+    const websocket_module = b.dependency("websocket", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("websocket");
+    const struct_env_module = b.dependency("struct_env", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("struct-env");
+
     const exe = b.addExecutable(.{
         .name = "zig-nostr-relay",
         .root_module = b.createModule(.{
@@ -43,15 +52,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "websocket", .module = b.dependency("websocket", .{
-                    .target = target,
-                    .optimize = optimize,
-                }).module("websocket") },
+                .{ .name = "websocket", .module = websocket_module },
                 .{ .name = "pg", .module = pg_module },
-                .{ .name = "struct-env", .module = b.dependency("struct_env", .{
-                    .target = target,
-                    .optimize = optimize,
-                }).module("struct-env") },
+                .{ .name = "struct-env", .module = struct_env_module },
             },
         }),
     });
@@ -96,8 +99,18 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "websocket", .module = websocket_module },
+                .{ .name = "pg", .module = pg_module },
+                .{ .name = "struct-env", .module = struct_env_module },
+            },
         }),
     });
+
+    // Link OpenSSL libraries (needed by the pg module)
+    unit_tests.root_module.linkSystemLibrary("ssl", .{});
+    unit_tests.root_module.linkSystemLibrary("crypto", .{});
+    unit_tests.root_module.link_libc = true;
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
