@@ -257,7 +257,7 @@ fn handleHttpRequest(stream: std.net.Stream, request: []const u8, allocator: std
     if (std.mem.eql(u8, method, "HEAD")) {
         // Check for NIP-11 request
         if (std.mem.indexOf(u8, request, "application/nostr+json") != null) {
-            const json_len = 438; // Precomputed NIP-11 response length
+            const json_len = 441; // Precomputed NIP-11 response length
             var response_buf: [512]u8 = undefined;
             const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\n" ++
                 "Content-Type: application/nostr+json\r\n" ++
@@ -295,7 +295,7 @@ const Nip11Response = struct {
     contact: []const u8,
     url: ?[]const u8 = null,
     icon: ?[]const u8 = null,
-    supported_nips: [10]u32 = [_]u32{ 1, 2, 4, 9, 11, 20, 22, 33, 40, 42 },
+    supported_nips: [11]u32 = [_]u32{ 1, 2, 4, 9, 11, 20, 22, 26, 33, 40, 42 },
     software: []const u8 = "https://github.com/mattn/zig-nostr-relay",
     version: []const u8 = "0.1.0",
     relay_countries: []const []const u8,
@@ -561,4 +561,9 @@ pub fn main() !void {
     }
 
     logger.info("Shutting down server...", .{});
+}
+
+test {
+    // Pull in tests from imported files.
+    _ = relay;
 }
