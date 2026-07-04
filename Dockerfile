@@ -1,5 +1,7 @@
 # Build stage
-FROM alpine:latest AS builder
+# alpine 3.23 ships zig 0.15.2; newer releases ship zig 0.16 which rejects
+# the legacy package hashes in build.zig.zon
+FROM alpine:3.23 AS builder
 RUN apk add --no-cache build-base zig openssl-dev openssl-libs-static
 
 WORKDIR /app
@@ -8,7 +10,7 @@ COPY . .
 RUN zig build
 
 # Final stage
-FROM alpine:latest
+FROM alpine:3.23
 RUN apk add --no-cache openssl ca-certificates
 
 WORKDIR /app
