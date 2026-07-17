@@ -137,14 +137,25 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, peer: std.net.Address, request
         .compression = null,
     };
 
+    // NIP-42: generate a per-connection challenge
+    var challenge_bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&challenge_bytes);
+    const challenge = std.fmt.bytesToHex(challenge_bytes, .lower);
+
     // Create Handler
-    const handler = relay.Handler{
+    var handler = relay.Handler{
         .conn = conn,
         .context = relay_context,
         .client_ip = client_ip,
+        .challenge = challenge,
     };
 
     logger.info("[{s}] Client connected", .{client_ip});
+
+    // NIP-42: send the challenge so the client can authenticate
+    var auth_buf: [32]u8 = undefined;
+    const auth_msg = try std.fmt.bufPrint(&auth_buf, "[\"AUTH\",\"{s}\"]", .{challenge});
+    conn.write(auth_msg) catch {};
 
     // Handle WebSocket messages
     // Use larger reader buffer to handle bigger frames
@@ -188,7 +199,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, peer: std.net.Address, request
                 .text, .binary => {
                     if (message.data.len > 0) {
                         logger.debug("Received: {s}", .{message.data});
-                        @constCast(&handler).clientMessage(allocator, message.data) catch |err| {
+                        handler.clientMessage(allocator, message.data) catch |err| {
                             logger.warn("[{s}] clientMessage error: {s}", .{ client_ip, @errorName(err) });
                             // If connection is broken, exit gracefully
                             if (err == error.EndOfStream or err == error.ConnectionResetByPeer or err == error.BrokenPipe) break :main_loop;
@@ -221,7 +232,7 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, peer: std.net.Address, request
     stream.close();
 
     // Remove subscriptions (prevents new broadcasts from including this connection)
-    @constCast(&handler).close();
+    handler.close();
 
     // Wait for any active broadcasts to finish before freeing conn memory.
     // After _closed is set and subscriptions are removed, no new broadcast will
@@ -257,7 +268,7 @@ fn handleHttpRequest(stream: std.net.Stream, request: []const u8, allocator: std
     if (std.mem.eql(u8, method, "HEAD")) {
         // Check for NIP-11 request
         if (std.mem.indexOf(u8, request, "application/nostr+json") != null) {
-            const json_len = 441; // Precomputed NIP-11 response length
+            const json_len = nip11_json_len; // Precomputed at startup from the actual config
             var response_buf: [512]u8 = undefined;
             const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\n" ++
                 "Content-Type: application/nostr+json\r\n" ++
@@ -295,13 +306,17 @@ const Nip11Response = struct {
     contact: []const u8,
     url: ?[]const u8 = null,
     icon: ?[]const u8 = null,
-    supported_nips: [11]u32 = [_]u32{ 1, 2, 4, 9, 11, 20, 22, 26, 33, 40, 42 },
+    supported_nips: [14]u32 = [_]u32{ 1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 26, 33, 40, 42 },
     software: []const u8 = "https://github.com/mattn/zig-nostr-relay",
     version: []const u8 = "0.1.0",
     relay_countries: []const []const u8,
 };
 
-fn serveNip11(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
+// NIP-11 response body length, computed at startup so the HEAD
+// Content-Length always matches the GET body exactly.
+var nip11_json_len: usize = 0;
+
+fn buildNip11Json(allocator: std.mem.Allocator, json_buf: *std.ArrayList(u8)) !void {
     const response_data = Nip11Response{
         .name = relay_context.config.relay_name,
         .description = relay_context.config.relay_description,
@@ -312,10 +327,14 @@ fn serveNip11(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
         .relay_countries = relay_context.config.relay_countries,
     };
 
+    try std.fmt.format(json_buf.writer(allocator), "{f}", .{std.json.fmt(response_data, .{})});
+}
+
+fn serveNip11(stream: std.net.Stream, allocator: std.mem.Allocator) !void {
     var json_buf = std.ArrayList(u8){};
     defer json_buf.deinit(allocator);
 
-    try std.fmt.format(json_buf.writer(allocator), "{f}", .{std.json.fmt(response_data, .{})});
+    try buildNip11Json(allocator, &json_buf);
 
     var response_buf: [2048]u8 = undefined;
     const response = try std.fmt.bufPrint(&response_buf, "HTTP/1.1 200 OK\r\n" ++
@@ -522,6 +541,14 @@ pub fn main() !void {
         },
     };
     relay_context = &context;
+
+    // Precompute the NIP-11 response length for HEAD requests
+    {
+        var json_buf = std.ArrayList(u8){};
+        defer json_buf.deinit(allocator);
+        try buildNip11Json(allocator, &json_buf);
+        nip11_json_len = json_buf.items.len;
+    }
 
     // Background DB heartbeat: periodically SELECT 1 on every idle
     // connection so idle reapers (NAT/LB/pgbouncer) don't silently kill
