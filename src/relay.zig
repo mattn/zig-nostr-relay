@@ -610,6 +610,23 @@ fn tagsJsonExpired(allocator: std.mem.Allocator, tagsj: []const u8, now: i64) bo
     return false;
 }
 
+// NIP-70: Protected Events
+// https://github.com/nostr-protocol/nips/blob/master/70.md
+// An event carrying a ["-"] tag may only be published to the relay by its
+// author, over a connection authenticated (NIP-42) as that author.
+fn eventIsProtected(ev: Event) bool {
+    for (ev.tags) |tag| {
+        if (tag.len >= 1 and std.mem.eql(u8, tag[0], "-")) return true;
+    }
+    return false;
+}
+
+fn protectedEventAllowed(ev: Event, authed_pubkey: ?[]const u8) bool {
+    if (!eventIsProtected(ev)) return true;
+    const authed = authed_pubkey orelse return false;
+    return std.mem.eql(u8, ev.pubkey, authed);
+}
+
 // NIP-42: Authentication of clients to relays
 // https://github.com/nostr-protocol/nips/blob/master/42.md
 // Verify the challenge and relay tags of a kind 22242 AUTH event
@@ -673,6 +690,16 @@ pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket
         logger.warn("Event has invalid signature", .{});
         const notice = "[\"NOTICE\",\"error: invalid signature\"]";
         _ = std.posix.write(socket, notice) catch {};
+        return;
+    }
+
+    // NIP-70: protected events require a connection authenticated (NIP-42)
+    // as the event author; this path carries no auth state, so reject them.
+    if (!protectedEventAllowed(ev, null)) {
+        logger.warn("Protected event rejected: not authenticated as author", .{});
+        var response: [512]u8 = undefined;
+        const response_len = try std.fmt.bufPrint(&response, "[\"OK\",\"{s}\",false,\"auth-required: need to authenticate\"]", .{ev.id});
+        _ = std.posix.write(socket, response_len) catch {};
         return;
     }
 
@@ -1408,6 +1435,15 @@ pub const Handler = struct {
         }
         logger.debug("Event signature verified", .{});
 
+        // NIP-70: protected events may only be published by their author over
+        // a connection authenticated (NIP-42) as that author.
+        const authed: ?[]const u8 = if (self.authed_pubkey) |*pk| pk[0..] else null;
+        if (!protectedEventAllowed(ev, authed)) {
+            logger.warn("[{s}] Protected event rejected: not authenticated as author", .{self.client_ip});
+            try self.sendOk(ev.id, false, "auth-required: need to authenticate");
+            return;
+        }
+
         if (!validateDelegation(ev)) {
             logger.warn("Event has invalid delegation", .{});
             var ng_buf: std.ArrayList(u8) = .{};
@@ -2089,6 +2125,46 @@ test "tagsJsonExpired parses the stored tags column" {
     // malformed JSON or timestamps never match
     try std.testing.expect(!tagsJsonExpired(allocator, "[[\"expiration\",\"oops\"]]", 1700000000));
     try std.testing.expect(!tagsJsonExpired(allocator, "[[\"expiration\"", 1700000000));
+}
+
+test "eventIsProtected detects the \"-\" tag" {
+    var no_tags = [_][][]u8{};
+    try std.testing.expect(!eventIsProtected(testEventWithTags(&no_tags)));
+
+    var protected_tag = [_][]u8{@constCast("-")};
+    var protected_tags = [_][][]u8{&protected_tag};
+    try std.testing.expect(eventIsProtected(testEventWithTags(&protected_tags)));
+
+    // other tags do not mark an event as protected
+    var e_tag = [_][]u8{ @constCast("e"), @constCast("abc") };
+    var other_tags = [_][][]u8{&e_tag};
+    try std.testing.expect(!eventIsProtected(testEventWithTags(&other_tags)));
+
+    // the "-" tag counts even when mixed with other tags
+    var mixed_tags = [_][][]u8{ &e_tag, &protected_tag };
+    try std.testing.expect(eventIsProtected(testEventWithTags(&mixed_tags)));
+}
+
+test "protectedEventAllowed requires auth as the event author" {
+    var protected_tag = [_][]u8{@constCast("-")};
+    var protected_tags = [_][][]u8{&protected_tag};
+    var pubkey = [_]u8{'0'} ** 64;
+    var ev = testEventWithTags(&protected_tags);
+    ev.pubkey = &pubkey;
+
+    // unauthenticated connections cannot publish protected events
+    try std.testing.expect(!protectedEventAllowed(ev, null));
+    // authenticated as a different pubkey
+    const other = [_]u8{'1'} ** 64;
+    try std.testing.expect(!protectedEventAllowed(ev, &other));
+    // authenticated as the author
+    const author = [_]u8{'0'} ** 64;
+    try std.testing.expect(protectedEventAllowed(ev, &author));
+
+    // unprotected events pass regardless of auth state
+    var no_tags = [_][][]u8{};
+    try std.testing.expect(protectedEventAllowed(testEventWithTags(&no_tags), null));
+    try std.testing.expect(protectedEventAllowed(testEventWithTags(&no_tags), &other));
 }
 
 test "authChallengeAndRelayMatch requires both matching tags" {
