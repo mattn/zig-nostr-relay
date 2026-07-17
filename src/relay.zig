@@ -562,6 +562,83 @@ fn verifyDelegationSignature(delegatee_pubkey: []const u8, delegator_pubkey: []c
     return verify(bytes_pk, msgbuf, bytes_sig) catch false;
 }
 
+// NIP-22: Event created_at Limits
+// https://github.com/nostr-protocol/nips/blob/master/22.md
+// Events whose created_at is more than `created_at_lower_limit` seconds in
+// the past or `created_at_upper_limit` seconds in the future are rejected.
+// A limit of 0 disables that side of the check.
+const created_at_lower_limit: i64 = 3 * 365 * 24 * 60 * 60; // 3 years in the past
+const created_at_upper_limit: i64 = 15 * 60; // 15 minutes in the future
+
+fn createdAtWithinLimits(created_at: i64, now: i64, lower: i64, upper: i64) bool {
+    if (lower > 0 and created_at < now - lower) return false;
+    if (upper > 0 and created_at > now + upper) return false;
+    return true;
+}
+
+// NIP-40: Expiration Timestamp
+// https://github.com/nostr-protocol/nips/blob/master/40.md
+// An event carrying an ["expiration", "<unix timestamp>"] tag must not be
+// served to clients after that timestamp.
+fn eventIsExpired(ev: Event, now: i64) bool {
+    for (ev.tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], "expiration")) {
+            const ts = std.fmt.parseInt(i64, tag[1], 10) catch continue;
+            if (ts <= now) return true;
+        }
+    }
+    return false;
+}
+
+// Same check for a stored event whose tags are only available as a JSON
+// string (the `tags` column). The cheap substring guard avoids parsing
+// JSON for the vast majority of events that carry no expiration tag.
+fn tagsJsonExpired(allocator: std.mem.Allocator, tagsj: []const u8, now: i64) bool {
+    if (std.mem.indexOf(u8, tagsj, "\"expiration\"") == null) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, tagsj, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    for (parsed.value.array.items) |tag| {
+        if (tag != .array or tag.array.items.len < 2) continue;
+        const name = tag.array.items[0];
+        const value = tag.array.items[1];
+        if (name != .string or value != .string) continue;
+        if (!std.mem.eql(u8, name.string, "expiration")) continue;
+        const ts = std.fmt.parseInt(i64, value.string, 10) catch continue;
+        if (ts <= now) return true;
+    }
+    return false;
+}
+
+// NIP-42: Authentication of clients to relays
+// https://github.com/nostr-protocol/nips/blob/master/42.md
+// Verify the challenge and relay tags of a kind 22242 AUTH event
+// independently: both must match, so a replayed AUTH event with two "relay"
+// tags cannot authenticate without the right challenge. Trailing slashes
+// are ignored when comparing relay URLs.
+fn trimTrailingSlashes(s: []const u8) []const u8 {
+    return std.mem.trimRight(u8, s, "/");
+}
+
+fn authChallengeAndRelayMatch(ev: Event, challenge: []const u8, relay_url: []const u8) bool {
+    const expected_relay = trimTrailingSlashes(relay_url);
+    var challenge_matched = false;
+    var relay_matched = false;
+    for (ev.tags) |tag| {
+        if (tag.len < 2) continue;
+        if (std.mem.eql(u8, tag[0], "challenge")) {
+            if (challenge.len > 0 and std.mem.eql(u8, tag[1], challenge)) {
+                challenge_matched = true;
+            }
+        } else if (std.mem.eql(u8, tag[0], "relay")) {
+            if (expected_relay.len > 0 and std.mem.eql(u8, trimTrailingSlashes(tag[1]), expected_relay)) {
+                relay_matched = true;
+            }
+        }
+    }
+    return challenge_matched and relay_matched;
+}
+
 fn make_tagsj(allocator: std.mem.Allocator, ev: Event) ![]const u8 {
     var result: std.ArrayList(u8) = .{};
     errdefer result.deinit(allocator);
@@ -927,6 +1004,10 @@ pub const Handler = struct {
     conn: *Conn,
     context: *Context,
     client_ip: []const u8 = "-",
+    // NIP-42: per-connection auth state. The challenge is generated when the
+    // connection is established and sent to the client as ["AUTH", challenge].
+    challenge: [16]u8 = [_]u8{'0'} ** 16,
+    authed_pubkey: ?[64]u8 = null,
 
     pub fn init(h: *const Handshake, conn: *Conn, context: *Context) !Handler {
         _ = h;
@@ -994,6 +1075,93 @@ pub const Handler = struct {
             if (std.mem.indexOf(u8, event.content, filter.search) == null) return false;
         }
         return true;
+    }
+
+    fn sendOk(self: *Handler, id: []const u8, ok: bool, reason: []const u8) !void {
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.context.allocator);
+        var writer = buf.writer(self.context.allocator);
+        try writer.writeAll("[\"OK\",\"");
+        try writer.writeAll(id);
+        try writer.writeAll(if (ok) "\",true,\"" else "\",false,\"");
+        try writer.writeAll(reason);
+        try writer.writeAll("\"]");
+        try self.conn.write(buf.items);
+    }
+
+    // NIP-42: restrict filters for kind-4 DMs and kind-1059 gift wraps to
+    // authenticated clients that are a party to the conversation. Returns
+    // the CLOSED reason when the filter is not allowed, null when it is.
+    fn validateFilterAccess(self: *Handler, filter: *Filter) ?[]const u8 {
+        const senders = filter.authors.items;
+        var receivers: []const []const u8 = &.{};
+        for (filter.tags.items) |tag| {
+            if (tag.len >= 1 and std.mem.eql(u8, tag[0], "p")) {
+                receivers = tag[1..];
+                break;
+            }
+        }
+        const authed: ?[]const u8 = if (self.authed_pubkey) |*pk| pk[0..] else null;
+
+        if (kindInSlice(filter.kinds.items, 4)) {
+            if (authed == null) {
+                return "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?";
+            } else if (senders.len == 1 and receivers.len < 2 and std.mem.eql(u8, senders[0], authed.?)) {
+                // sender is the authenticated user
+            } else if (receivers.len == 1 and senders.len < 2 and std.mem.eql(u8, receivers[0], authed.?)) {
+                // receiver is the authenticated user
+            } else {
+                return "restricted: authenticated user does not have authorization for requested filters.";
+            }
+        }
+
+        if (kindInSlice(filter.kinds.items, 1059)) {
+            if (authed == null) {
+                return "restricted: this relay does not serve gift-wrapped events to unauthenticated users, does your client implement NIP-42?";
+            } else if (receivers.len == 1 and std.mem.eql(u8, receivers[0], authed.?)) {
+                // receiver is the authenticated user
+            } else {
+                return "restricted: authenticated user does not have authorization for requested filters.";
+            }
+        }
+
+        return null;
+    }
+
+    // NIP-42: handle the client's ["AUTH", <kind 22242 event>] message.
+    pub fn handleAuth(self: *Handler, value: std.json.Value) !void {
+        const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, value.array.items[1], .{});
+        const ev = parsedEvent.value;
+
+        const verified = verify_event(self.context.allocator, ev) catch false;
+        if (!verified) {
+            logger.warn("[{s}] AUTH event has invalid signature", .{self.client_ip});
+            try self.sendOk(ev.id, false, "invalid: event id or signature is invalid");
+            return;
+        }
+
+        if (ev.kind != 22242) {
+            try self.sendOk(ev.id, false, "invalid: auth event kind must be 22242");
+            return;
+        }
+
+        // created_at must be close (within ~10 minutes) to the current time
+        // to prevent replay of a previously observed AUTH event.
+        const now = std.time.timestamp();
+        const diff = now - ev.created_at;
+        if (diff > 600 or diff < -600) {
+            try self.sendOk(ev.id, false, "invalid: auth event created_at is out of range");
+            return;
+        }
+
+        if (authChallengeAndRelayMatch(ev, &self.challenge, self.context.config.relay_url) and ev.pubkey.len == 64) {
+            self.authed_pubkey = ev.pubkey[0..64].*;
+            logger.info("[{s}] Client authenticated: pubkey={s}", .{ self.client_ip, ev.pubkey[0..16] });
+            try self.sendOk(ev.id, true, "");
+            return;
+        }
+
+        try self.sendOk(ev.id, false, "error: failed to authenticate");
     }
 
     fn delete_record_by_id(self: *Handler, tag: [][]u8) !bool {
@@ -1223,6 +1391,13 @@ pub const Handler = struct {
 
         logger.info("[{s}] Received EVENT: id={s}, kind={d}, pubkey={s}", .{ self.client_ip, ev.id[0..16], ev.kind, ev.pubkey[0..16] });
 
+        // NIP-22: reject events whose created_at is outside the accepted window
+        if (!createdAtWithinLimits(ev.created_at, std.time.timestamp(), created_at_lower_limit, created_at_upper_limit)) {
+            logger.warn("Event created_at out of range: {d}", .{ev.created_at});
+            try self.sendOk(ev.id, false, "invalid: created_at is out of the acceptable range");
+            return;
+        }
+
         const verified = verify_event(self.context.allocator, ev) catch |err| {
             logger.warn("Event verification failed: {s}", .{@errorName(err)});
             return;
@@ -1254,8 +1429,10 @@ pub const Handler = struct {
                     }
                 }
             }
+        } else if (20000 <= ev.kind and ev.kind < 30000) {
+            // NIP-16: ephemeral events are broadcast to subscribers but never stored
         } else {
-            if (20000 <= ev.kind and ev.kind < 30000) {} else if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
+            if (ev.kind == 0 or ev.kind == 3 or (10000 <= ev.kind and ev.kind < 20000)) {
                 if (!try self.delete_record_by_kind_and_pubkey(ev.kind, ev.pubkey)) {
                     try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
                     return;
@@ -1292,7 +1469,8 @@ pub const Handler = struct {
         var subscribers_to_notify = std.ArrayList(Subscriber){};
         defer subscribers_to_notify.deinit(self.context.allocator);
 
-        {
+        // NIP-40: events that are already expired are not broadcast
+        if (!eventIsExpired(ev, std.time.timestamp())) {
             self.context.subscribers_mutex.lock();
             defer self.context.subscribers_mutex.unlock();
 
@@ -1365,8 +1543,32 @@ pub const Handler = struct {
         }
         const sub = value.array.items[1].string;
 
-        const filters = try make_filter(self.context.allocator, value.array);
+        var filters = try make_filter(self.context.allocator, value.array);
         logger.info("[{s}] Received REQ: subscription={s}, filters={d}", .{ self.client_ip, sub, filters.items.len });
+
+        // NIP-42: kind-4 DMs and kind-1059 gift wraps are only served to
+        // authenticated clients that are a party to the conversation.
+        for (filters.items) |filter| {
+            if (self.validateFilterAccess(filter)) |reason| {
+                for (filters.items) |f| {
+                    f.deinit();
+                    self.context.allocator.destroy(f);
+                }
+                filters.deinit(self.context.allocator);
+
+                var closed_buf: std.ArrayList(u8) = .{};
+                defer closed_buf.deinit(self.context.allocator);
+                var closed_writer = closed_buf.writer(self.context.allocator);
+                try closed_writer.writeAll("[\"CLOSED\",\"");
+                try closed_writer.writeAll(sub);
+                try closed_writer.writeAll("\",\"");
+                try closed_writer.writeAll(reason);
+                try closed_writer.writeAll("\"]");
+                try self.conn.write(closed_buf.items);
+                return;
+            }
+        }
+
         const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters);
 
         // Add subscriber with mutex protection
@@ -1544,6 +1746,7 @@ pub const Handler = struct {
             var res = try stmt.execute();
             defer res.deinit();
 
+            const now = std.time.timestamp();
             while (try res.next()) |row| {
                 if (row.values.len != 7) break;
 
@@ -1554,6 +1757,9 @@ pub const Handler = struct {
                 const tagsj = try row.get([]u8, 4);
                 const content = try row.get([]u8, 5);
                 const sig = try row.get([]u8, 6);
+
+                // NIP-40: expired events are not served to clients
+                if (tagsJsonExpired(self.context.allocator, tagsj, now)) continue;
 
                 var buf: std.ArrayList(u8) = .{};
                 errdefer buf.deinit(self.context.allocator);
@@ -1690,6 +1896,8 @@ pub const Handler = struct {
             try self.handleReq(parsed.value);
         } else if (std.mem.eql(u8, msg_type, "CLOSE")) {
             try self.handleCloseMsg(parsed.value);
+        } else if (std.mem.eql(u8, msg_type, "AUTH")) {
+            try self.handleAuth(parsed.value);
         }
     }
 
@@ -1823,4 +2031,83 @@ test "validateDelegation accepts valid delegation and rejects forged signature" 
     var forged = [_]u8{'3'} ** 128;
     tag[3] = &forged;
     try std.testing.expect(!validateDelegation(ev));
+}
+
+test "createdAtWithinLimits enforces the accepted window" {
+    const now: i64 = 1700000000;
+
+    // limits disabled
+    try std.testing.expect(createdAtWithinLimits(now - 100000, now, 0, 0));
+    try std.testing.expect(createdAtWithinLimits(now + 100000, now, 0, 0));
+
+    // upper boundary
+    try std.testing.expect(createdAtWithinLimits(now + 900, now, 0, 900));
+    try std.testing.expect(!createdAtWithinLimits(now + 901, now, 0, 900));
+
+    // lower boundary
+    try std.testing.expect(createdAtWithinLimits(now - 3600, now, 3600, 900));
+    try std.testing.expect(!createdAtWithinLimits(now - 3601, now, 3600, 900));
+}
+
+fn testEventWithTags(tags: [][][]u8) Event {
+    var pubkey = [_]u8{'0'} ** 64;
+    return Event{
+        .id = @constCast(""),
+        .kind = 1,
+        .created_at = 100,
+        .pubkey = &pubkey,
+        .content = @constCast(""),
+        .sig = @constCast(""),
+        .tags = tags,
+    };
+}
+
+test "eventIsExpired honors the expiration tag" {
+    var no_tags = [_][][]u8{};
+    try std.testing.expect(!eventIsExpired(testEventWithTags(&no_tags), 1700000000));
+
+    var expired_tag = [_][]u8{ @constCast("expiration"), @constCast("1600000000") };
+    var expired_tags = [_][][]u8{&expired_tag};
+    try std.testing.expect(eventIsExpired(testEventWithTags(&expired_tags), 1700000000));
+    // boundary: expired exactly at the expiration timestamp
+    try std.testing.expect(eventIsExpired(testEventWithTags(&expired_tags), 1600000000));
+    // not yet expired
+    try std.testing.expect(!eventIsExpired(testEventWithTags(&expired_tags), 1599999999));
+
+    // malformed timestamps are ignored
+    var bogus_tag = [_][]u8{ @constCast("expiration"), @constCast("not-a-number") };
+    var bogus_tags = [_][][]u8{&bogus_tag};
+    try std.testing.expect(!eventIsExpired(testEventWithTags(&bogus_tags), 1700000000));
+}
+
+test "tagsJsonExpired parses the stored tags column" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!tagsJsonExpired(allocator, "[]", 1700000000));
+    try std.testing.expect(!tagsJsonExpired(allocator, "[[\"e\",\"abc\"]]", 1700000000));
+    try std.testing.expect(tagsJsonExpired(allocator, "[[\"expiration\",\"1600000000\"]]", 1700000000));
+    try std.testing.expect(!tagsJsonExpired(allocator, "[[\"expiration\",\"1800000000\"]]", 1700000000));
+    // malformed JSON or timestamps never match
+    try std.testing.expect(!tagsJsonExpired(allocator, "[[\"expiration\",\"oops\"]]", 1700000000));
+    try std.testing.expect(!tagsJsonExpired(allocator, "[[\"expiration\"", 1700000000));
+}
+
+test "authChallengeAndRelayMatch requires both matching tags" {
+    var challenge_tag = [_][]u8{ @constCast("challenge"), @constCast("deadbeefdeadbeef") };
+    var relay_tag = [_][]u8{ @constCast("relay"), @constCast("wss://example.com/") };
+    var tags = [_][][]u8{ &challenge_tag, &relay_tag };
+    var ev = testEventWithTags(&tags);
+    ev.kind = 22242;
+
+    try std.testing.expect(authChallengeAndRelayMatch(ev, "deadbeefdeadbeef", "wss://example.com"));
+    // trailing slashes on either side are ignored
+    try std.testing.expect(authChallengeAndRelayMatch(ev, "deadbeefdeadbeef", "wss://example.com/"));
+    // wrong challenge
+    try std.testing.expect(!authChallengeAndRelayMatch(ev, "0000000000000000", "wss://example.com"));
+    // wrong relay URL
+    try std.testing.expect(!authChallengeAndRelayMatch(ev, "deadbeefdeadbeef", "wss://other.example.com"));
+    // a second relay tag must not stand in for a matching challenge
+    var relay_tag2 = [_][]u8{ @constCast("relay"), @constCast("wss://example.com") };
+    var two_relays = [_][][]u8{ &relay_tag, &relay_tag2 };
+    ev.tags = &two_relays;
+    try std.testing.expect(!authChallengeAndRelayMatch(ev, "deadbeefdeadbeef", "wss://example.com"));
 }
