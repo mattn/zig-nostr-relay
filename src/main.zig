@@ -306,7 +306,7 @@ const Nip11Response = struct {
     contact: []const u8,
     url: ?[]const u8 = null,
     icon: ?[]const u8 = null,
-    supported_nips: [15]u32 = [_]u32{ 1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 26, 33, 40, 42, 70 },
+    supported_nips: [16]u32 = [_]u32{ 1, 2, 4, 9, 11, 12, 15, 16, 20, 22, 26, 28, 33, 40, 42, 70 },
     software: []const u8 = "https://github.com/mattn/zig-nostr-relay",
     version: []const u8 = "0.1.0",
     relay_countries: []const []const u8,
