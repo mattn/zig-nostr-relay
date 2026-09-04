@@ -1192,7 +1192,7 @@ pub const Handler = struct {
         try self.sendOk(ev.id, false, "error: failed to authenticate");
     }
 
-    fn delete_record_by_id(self: *Handler, tag: [][]u8) !bool {
+    fn delete_record_by_id(self: *Handler, tag: [][]u8, deleter_pubkey: []u8) !bool {
         const bindValue = union(enum) {
             number: i64,
             string: []const u8,
@@ -1202,6 +1202,7 @@ pub const Handler = struct {
         var parambuf: std.ArrayList(u8) = .{};
         defer parambuf.deinit(self.context.allocator);
 
+        try params.append(self.context.allocator, .{ .string = deleter_pubkey });
         for (tag) |id| {
             try params.append(self.context.allocator, .{ .string = id });
             const s = try std.fmt.allocPrint(self.context.allocator, "${}", .{params.items.len});
@@ -1213,7 +1214,14 @@ pub const Handler = struct {
 
         _ = parambuf.pop();
 
-        const sql = try std.fmt.allocPrint(self.context.allocator, "delete from event where id in ({s})", .{parambuf.items});
+        // NIP-09 allows authors to delete their own events. NIP-59 also
+        // allows recipients to delete gift wraps addressed to them, since
+        // kind 1059 is signed with an unrelated one-time key.
+        const sql = try std.fmt.allocPrint(
+            self.context.allocator,
+            "delete from event where id in ({s}) and (pubkey = $1 or (kind = 1059 and exists (select 1 from jsonb_array_elements(tags) t where t->>0 = 'p' and t->>1 = $1)))",
+            .{parambuf.items},
+        );
         defer self.context.allocator.free(sql);
 
         const db = try acquirePool(self.context.pool);
@@ -1461,7 +1469,7 @@ pub const Handler = struct {
         if (ev.kind == 5) {
             for (ev.tags) |tag| {
                 if (tag.len >= 2 and std.mem.eql(u8, tag[0], "e")) {
-                    if (!try self.delete_record_by_id(tag[1..])) {
+                    if (!try self.delete_record_by_id(tag[1..], ev.pubkey)) {
                         try self.conn.write("[\"NOTICE\", \"error: failed to delete record\"]");
                         return;
                     }
