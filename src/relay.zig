@@ -678,6 +678,7 @@ fn make_tagsj(allocator: std.mem.Allocator, ev: Event) ![]const u8 {
 
 pub fn handleEventMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t, pool: *pg.Pool, value: std.json.Value) !void {
     const parsedEvent = try std.json.parseFromValue(Event, allocator, value.array.items[1], .{});
+    defer parsedEvent.deinit();
     const ev = parsedEvent.value;
 
     const verified = verifyEvent(allocator, ev) catch |err| {
@@ -901,9 +902,8 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
         }
 
         if (filter.search.len > 0) {
-            try sql.writer(allocator).print(" AND content LIKE ${}", .{params.items.len + 1});
-            const search_pattern = try std.fmt.allocPrint(allocator, "%{s}%", .{filter.search});
-            try params.append(allocator, search_pattern);
+            try params.append(allocator, filter.search);
+            try sql.writer(allocator).print(" AND content LIKE ('%' || ${} || '%')", .{params.items.len});
         }
     }
 
@@ -1158,6 +1158,7 @@ pub const Handler = struct {
     // NIP-42: handle the client's ["AUTH", <kind 22242 event>] message.
     pub fn handleAuth(self: *Handler, value: std.json.Value) !void {
         const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, value.array.items[1], .{});
+        defer parsedEvent.deinit();
         const ev = parsedEvent.value;
 
         const verified = verify_event(self.context.allocator, ev) catch false;
@@ -1414,6 +1415,7 @@ pub const Handler = struct {
 
     pub fn handleEvent(self: *Handler, value: std.json.Value) !void {
         const parsedEvent = try std.json.parseFromValue(Event, self.context.allocator, value.array.items[1], .{});
+        defer parsedEvent.deinit();
         const ev = parsedEvent.value;
 
         logger.info("[{s}] Received EVENT: id={s}, kind={d}, pubkey={s}", .{ self.client_ip, ev.id[0..16], ev.kind, ev.pubkey[0..16] });
@@ -1733,9 +1735,8 @@ pub const Handler = struct {
                 } else {
                     try sql_writer.writeAll(" AND ");
                 }
-                const search_pattern = try std.fmt.allocPrint(self.context.allocator, "%{s}%", .{filter.search});
-                try params.append(self.context.allocator, .{ .string = search_pattern });
-                try sql_writer.print("content LIKE ${}", .{params.items.len});
+                try params.append(self.context.allocator, .{ .string = filter.search });
+                try sql_writer.print("content LIKE ('%' || ${} || '%')", .{params.items.len});
             }
 
             if (filter.limit < limit) {
