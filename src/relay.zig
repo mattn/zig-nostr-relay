@@ -370,15 +370,17 @@ pub const Subscriber = struct {
     sub: []const u8,
     conn: *Conn,
     filters: std.ArrayList(*Filter),
+    authed_pubkey: ?[64]u8,
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, sub: []const u8, conn: *Conn, filters: std.ArrayList(*Filter)) !Self {
+    pub fn init(allocator: std.mem.Allocator, sub: []const u8, conn: *Conn, filters: std.ArrayList(*Filter), authed_pubkey: ?[64]u8) !Self {
         return .{
             .sub = try allocator.dupe(u8, sub),
             .conn = conn,
             .filters = filters,
+            .authed_pubkey = authed_pubkey,
             .allocator = allocator,
         };
     }
@@ -1104,6 +1106,17 @@ pub const Handler = struct {
         return true;
     }
 
+    fn eventVisibleTo(event: Event, authed_pubkey: ?[64]u8) bool {
+        if (event.kind != 1059) return true;
+        const recipient = authed_pubkey orelse return false;
+        for (event.tags) |tag| {
+            if (tag.len >= 2 and std.mem.eql(u8, tag[0], "p") and std.mem.eql(u8, tag[1], recipient[0..])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn sendOk(self: *Handler, id: []const u8, ok: bool, reason: []const u8) !void {
         var buf: std.ArrayList(u8) = .{};
         defer buf.deinit(self.context.allocator);
@@ -1530,6 +1543,10 @@ pub const Handler = struct {
                     logger.debug("  Subscriber {s}: event doesn't match filters", .{subscriber.sub});
                     continue;
                 }
+                if (!eventVisibleTo(ev, subscriber.authed_pubkey)) {
+                    logger.debug("  Subscriber {s}: gift wrap is not visible to this connection", .{subscriber.sub});
+                    continue;
+                }
                 logger.debug("  Subscriber {s}: event matches, queuing for notification", .{subscriber.sub});
                 try subscribers_to_notify.append(self.context.allocator, subscriber);
             }
@@ -1615,7 +1632,7 @@ pub const Handler = struct {
             }
         }
 
-        const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters);
+        const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters, self.authed_pubkey);
 
         // Add subscriber with mutex protection
         // Per NIP-01: if subscription_id already exists for this connection, replace it
@@ -1750,6 +1767,21 @@ pub const Handler = struct {
             if (filter.limit < limit) {
                 limit = filter.limit;
             }
+        }
+
+        // A broad filter or an id-only lookup can also match gift wraps.
+        // Never serve kind 1059 unless this connection authenticated as the
+        // event's p-tagged recipient.
+        if (!has_where) {
+            try sql_writer.writeAll(" WHERE ");
+        } else {
+            try sql_writer.writeAll(" AND ");
+        }
+        if (self.authed_pubkey) |recipient| {
+            try params.append(self.context.allocator, .{ .string = recipient[0..] });
+            try sql_writer.print("(kind <> 1059 OR exists (select 1 from jsonb_array_elements(tags) t where t->>0 = 'p' and t->>1 = ${}))", .{params.items.len});
+        } else {
+            try sql_writer.writeAll("kind <> 1059");
         }
 
         try sql_writer.print(" ORDER BY created_at DESC LIMIT {}", .{limit});
@@ -2138,6 +2170,22 @@ test "NIP-50 search filters live events by content" {
 
     event.content = @constCast("unrelated content");
     try std.testing.expect(!Handler.filterMatches(event, &filter));
+}
+
+test "NIP-59 gift wraps are visible only to the authenticated recipient" {
+    var p_tag = [_][]u8{ @constCast("p"), @constCast("1111111111111111111111111111111111111111111111111111111111111111") };
+    var tags = [_][][]u8{&p_tag};
+    var event = testEventWithTags(&tags);
+    event.kind = 1059;
+
+    const recipient = [_]u8{'1'} ** 64;
+    const stranger = [_]u8{'2'} ** 64;
+    try std.testing.expect(Handler.eventVisibleTo(event, recipient));
+    try std.testing.expect(!Handler.eventVisibleTo(event, stranger));
+    try std.testing.expect(!Handler.eventVisibleTo(event, null));
+
+    event.kind = 1;
+    try std.testing.expect(Handler.eventVisibleTo(event, null));
 }
 
 test "tagsJsonExpired parses the stored tags column" {
