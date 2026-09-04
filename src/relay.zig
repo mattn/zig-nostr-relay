@@ -2117,6 +2117,21 @@ test "eventIsExpired honors the expiration tag" {
     try std.testing.expect(!eventIsExpired(testEventWithTags(&bogus_tags), 1700000000));
 }
 
+test "NIP-50 search filters live events by content" {
+    const allocator = std.testing.allocator;
+    var filter = Filter.init(allocator);
+    defer filter.deinit();
+    filter.search = try allocator.dupe(u8, "needle");
+
+    var no_tags = [_][][]u8{};
+    var event = testEventWithTags(&no_tags);
+    event.content = @constCast("a needle in content");
+    try std.testing.expect(Handler.filterMatches(event, &filter));
+
+    event.content = @constCast("unrelated content");
+    try std.testing.expect(!Handler.filterMatches(event, &filter));
+}
+
 test "tagsJsonExpired parses the stored tags column" {
     const allocator = std.testing.allocator;
     try std.testing.expect(!tagsJsonExpired(allocator, "[]", 1700000000));
