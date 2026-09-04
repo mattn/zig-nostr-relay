@@ -308,7 +308,7 @@ const Nip11Response = struct {
     icon: ?[]const u8 = null,
     // NIP-17's relay requirement is fulfilled by the NIP-42/NIP-59
     // recipient-only handling of kind 1059 gift wraps.
-    supported_nips: [13]u32 = [_]u32{ 1, 4, 9, 11, 17, 26, 40, 42, 50, 59, 66, 70, 78 },
+    supported_nips: [14]u32 = [_]u32{ 1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78 },
     software: []const u8 = "https://github.com/mattn/zig-nostr-relay",
     version: []const u8 = "0.1.0",
     relay_countries: []const []const u8,

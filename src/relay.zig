@@ -298,6 +298,12 @@ fn writeJsonString(writer: anytype, s: []const u8) !void {
     try writer.writeAll("\"");
 }
 
+fn writeCountResponse(writer: anytype, subscription_id: []const u8, count: usize) !void {
+    try writer.writeAll("[\"COUNT\",");
+    try writeJsonString(writer, subscription_id);
+    try writer.print(",{{\"count\":{d}}}]", .{count});
+}
+
 const Event = struct {
     id: []u8,
     kind: i32 = 0,
@@ -1599,7 +1605,7 @@ pub const Handler = struct {
         try self.conn.write(buf.items);
     }
 
-    pub fn handleReq(self: *Handler, value: std.json.Value) !void {
+    fn handleQuery(self: *Handler, value: std.json.Value, count_only: bool) !void {
         if (value.array.items.len < 3) {
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
             return;
@@ -1607,17 +1613,26 @@ pub const Handler = struct {
         const sub = value.array.items[1].string;
 
         var filters = try make_filter(self.context.allocator, value.array);
-        logger.info("[{s}] Received REQ: subscription={s}, filters={d}", .{ self.client_ip, sub, filters.items.len });
+        defer if (count_only) {
+            for (filters.items) |filter| {
+                filter.deinit();
+                self.context.allocator.destroy(filter);
+            }
+            filters.deinit(self.context.allocator);
+        };
+        logger.info("[{s}] Received {s}: subscription={s}, filters={d}", .{ self.client_ip, if (count_only) "COUNT" else "REQ", sub, filters.items.len });
 
         // NIP-42: kind-4 DMs and kind-1059 gift wraps are only served to
         // authenticated clients that are a party to the conversation.
         for (filters.items) |filter| {
             if (self.validateFilterAccess(filter)) |reason| {
-                for (filters.items) |f| {
-                    f.deinit();
-                    self.context.allocator.destroy(f);
+                if (!count_only) {
+                    for (filters.items) |f| {
+                        f.deinit();
+                        self.context.allocator.destroy(f);
+                    }
+                    filters.deinit(self.context.allocator);
                 }
-                filters.deinit(self.context.allocator);
 
                 var closed_buf: std.ArrayList(u8) = .{};
                 defer closed_buf.deinit(self.context.allocator);
@@ -1632,26 +1647,28 @@ pub const Handler = struct {
             }
         }
 
-        const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters, self.authed_pubkey);
+        if (!count_only) {
+            const subscriber = try Subscriber.init(self.context.allocator, sub, self.conn, filters, self.authed_pubkey);
 
-        // Add subscriber with mutex protection
-        // Per NIP-01: if subscription_id already exists for this connection, replace it
-        {
-            self.context.subscribers_mutex.lock();
-            defer self.context.subscribers_mutex.unlock();
-            var replaced = false;
-            for (self.context.subscribers.items, 0..) |*existing, i| {
-                if (existing.conn == self.conn and std.mem.eql(u8, existing.sub, sub)) {
-                    existing.deinit();
-                    self.context.subscribers.items[i] = subscriber;
-                    replaced = true;
-                    logger.debug("Replaced existing subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
-                    break;
+            // Add subscriber with mutex protection
+            // Per NIP-01: if subscription_id already exists for this connection, replace it
+            {
+                self.context.subscribers_mutex.lock();
+                defer self.context.subscribers_mutex.unlock();
+                var replaced = false;
+                for (self.context.subscribers.items, 0..) |*existing, i| {
+                    if (existing.conn == self.conn and std.mem.eql(u8, existing.sub, sub)) {
+                        existing.deinit();
+                        self.context.subscribers.items[i] = subscriber;
+                        replaced = true;
+                        logger.debug("Replaced existing subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
+                        break;
+                    }
                 }
-            }
-            if (!replaced) {
-                try self.context.subscribers.append(self.context.allocator, subscriber);
-                logger.debug("Added subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
+                if (!replaced) {
+                    try self.context.subscribers.append(self.context.allocator, subscriber);
+                    logger.debug("Added subscriber, total subscribers: {d}", .{self.context.subscribers.items.len});
+                }
             }
         }
 
@@ -1784,7 +1801,9 @@ pub const Handler = struct {
             try sql_writer.writeAll("kind <> 1059");
         }
 
-        try sql_writer.print(" ORDER BY created_at DESC LIMIT {}", .{limit});
+        if (!count_only) {
+            try sql_writer.print(" ORDER BY created_at DESC LIMIT {}", .{limit});
+        }
 
         // Collect all event messages in memory first, then release DB connection
         // before writing to the (potentially slow) client socket.
@@ -1794,6 +1813,7 @@ pub const Handler = struct {
             messages.deinit(self.context.allocator);
         }
 
+        var count: usize = 0;
         {
             const db = acquirePool(self.context.pool) catch |err| {
                 const stats = self.context.pool.stats();
@@ -1838,6 +1858,11 @@ pub const Handler = struct {
                 // NIP-40: expired events are not served to clients
                 if (tagsJsonExpired(self.context.allocator, tagsj, now)) continue;
 
+                if (count_only) {
+                    count += 1;
+                    continue;
+                }
+
                 var buf: std.ArrayList(u8) = .{};
                 errdefer buf.deinit(self.context.allocator);
                 var event_writer = buf.writer(self.context.allocator);
@@ -1862,6 +1887,14 @@ pub const Handler = struct {
             }
         }
 
+        if (count_only) {
+            var count_buf: std.ArrayList(u8) = .{};
+            defer count_buf.deinit(self.context.allocator);
+            try writeCountResponse(count_buf.writer(self.context.allocator), sub, count);
+            try self.conn.write(count_buf.items);
+            return;
+        }
+
         // DB connection released — now write to client
         for (messages.items) |msg| {
             try self.conn.write(msg);
@@ -1874,6 +1907,14 @@ pub const Handler = struct {
         try eose_writer.writeAll(sub);
         try eose_writer.writeAll("\"]");
         try self.conn.write(buf.items);
+    }
+
+    pub fn handleReq(self: *Handler, value: std.json.Value) !void {
+        try self.handleQuery(value, false);
+    }
+
+    pub fn handleCount(self: *Handler, value: std.json.Value) !void {
+        try self.handleQuery(value, true);
     }
 
     pub fn handleCloseMsg(self: *Handler, value: std.json.Value) !void {
@@ -1971,6 +2012,8 @@ pub const Handler = struct {
             try self.handleEvent(parsed.value);
         } else if (std.mem.eql(u8, msg_type, "REQ")) {
             try self.handleReq(parsed.value);
+        } else if (std.mem.eql(u8, msg_type, "COUNT")) {
+            try self.handleCount(parsed.value);
         } else if (std.mem.eql(u8, msg_type, "CLOSE")) {
             try self.handleCloseMsg(parsed.value);
         } else if (std.mem.eql(u8, msg_type, "AUTH")) {
@@ -2170,6 +2213,15 @@ test "NIP-50 search filters live events by content" {
 
     event.content = @constCast("unrelated content");
     try std.testing.expect(!Handler.filterMatches(event, &filter));
+}
+
+test "NIP-45 COUNT response includes an escaped subscription id" {
+    const allocator = std.testing.allocator;
+    var response: std.ArrayList(u8) = .{};
+    defer response.deinit(allocator);
+
+    try writeCountResponse(response.writer(allocator), "count\"check", 42);
+    try std.testing.expectEqualStrings("[\"COUNT\",\"count\\\"check\",{\"count\":42}]", response.items);
 }
 
 test "NIP-59 gift wraps are visible only to the authenticated recipient" {
