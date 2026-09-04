@@ -858,7 +858,7 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
 
     var limit: i64 = 500;
     for (filters.items) |filter| {
-        if (filter.limit > 0 and filter.limit < limit) {
+        if (filter.limit >= 0 and filter.limit < limit) {
             limit = filter.limit;
         }
 
