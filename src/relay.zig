@@ -314,6 +314,20 @@ const Event = struct {
     tags: [][][]u8,
 };
 
+/// NIP-50: wrap a search term as a LIKE pattern, escaping the wildcards so a
+/// search for "%" cannot match every event. Caller owns the result.
+fn likePattern(allocator: std.mem.Allocator, term: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '%');
+    for (term) |c| {
+        if (c == '%' or c == '_' or c == '\\') try out.append(allocator, '\\');
+        try out.append(allocator, c);
+    }
+    try out.append(allocator, '%');
+    return out.toOwnedSlice(allocator);
+}
+
 const Filter = struct {
     ids: std.ArrayList([]const u8) = undefined,
     authors: std.ArrayList([]const u8) = undefined,
@@ -449,6 +463,11 @@ pub fn initDatabase(pool: *pg.Pool) !void {
         \\CREATE INDEX IF NOT EXISTS kindidx ON event (kind);
         \\CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC);
         \\CREATE INDEX IF NOT EXISTS arbitrarytagvalues ON event USING gin (tagvalues);
+        \\-- NIP-50: search is a substring match, so a trigram index keeps the
+        \\-- leading wildcard off a sequential scan. Terms shorter than 3
+        \\-- characters produce no trigrams and still fall back to a scan.
+        \\CREATE EXTENSION IF NOT EXISTS pg_trgm;
+        \\CREATE INDEX IF NOT EXISTS contenttrgmidx ON event USING gin (content gin_trgm_ops);
     , .{});
 }
 
@@ -862,6 +881,13 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
     defer sql.deinit(allocator);
     var params = std.ArrayList([]const u8){};
     defer params.deinit(allocator);
+    // NIP-50 patterns are built here, so they outlive the query but not the
+    // function; params only borrows them.
+    var patterns = std.ArrayList([]u8){};
+    defer {
+        for (patterns.items) |pattern| allocator.free(pattern);
+        patterns.deinit(allocator);
+    }
 
     try sql.appendSlice(allocator, "SELECT id, pubkey, created_at, kind, tags, content, sig FROM event WHERE 1=1");
 
@@ -910,8 +936,13 @@ pub fn handleReqMessage(allocator: std.mem.Allocator, socket: std.posix.socket_t
         }
 
         if (filter.search.len > 0) {
-            try params.append(allocator, filter.search);
-            try sql.writer(allocator).print(" AND content LIKE ('%' || ${} || '%')", .{params.items.len});
+            var it = std.mem.tokenizeAny(u8, filter.search, " \t\n\r");
+            while (it.next()) |term| {
+                const pattern = try likePattern(allocator, term);
+                try patterns.append(allocator, pattern);
+                try params.append(allocator, pattern);
+                try sql.writer(allocator).print(" AND content ILIKE ${} ESCAPE '\\'", .{params.items.len});
+            }
         }
     }
 
@@ -1106,8 +1137,13 @@ pub const Handler = struct {
         if (filter.since > 0 and event.created_at < filter.since) return false;
         if (filter.until > 0 and event.created_at > filter.until) return false;
         if (filter.search.len > 0) {
-            // Simple substring search in content
-            if (std.mem.indexOf(u8, event.content, filter.search) == null) return false;
+            // NIP-50: every whitespace-separated term must occur in the
+            // content, case-insensitively, which is what the stored query
+            // asks the database for.
+            var it = std.mem.tokenizeAny(u8, filter.search, " \t\n\r");
+            while (it.next()) |term| {
+                if (std.ascii.indexOfIgnoreCase(event.content, term) == null) return false;
+            }
         }
         return true;
     }
@@ -1678,6 +1714,13 @@ pub const Handler = struct {
         };
         var params = std.ArrayList(bindValue){};
         defer params.deinit(self.context.allocator);
+        // NIP-50 patterns are built here, so they outlive the query but not
+        // the function; params only borrows them.
+        var patterns = std.ArrayList([]u8){};
+        defer {
+            for (patterns.items) |pattern| self.context.allocator.free(pattern);
+            patterns.deinit(self.context.allocator);
+        }
 
         var sqlbuf: std.ArrayList(u8) = .{};
         defer sqlbuf.deinit(self.context.allocator);
@@ -1771,14 +1814,19 @@ pub const Handler = struct {
                 try sql_writer.print("created_at <= ${}", .{params.items.len});
             }
             if (filter.search.len > 0) {
-                if (!has_where) {
-                    try sql_writer.writeAll(" WHERE ");
-                    has_where = true;
-                } else {
-                    try sql_writer.writeAll(" AND ");
+                var it = std.mem.tokenizeAny(u8, filter.search, " \t\n\r");
+                while (it.next()) |term| {
+                    if (!has_where) {
+                        try sql_writer.writeAll(" WHERE ");
+                        has_where = true;
+                    } else {
+                        try sql_writer.writeAll(" AND ");
+                    }
+                    const pattern = try likePattern(self.context.allocator, term);
+                    try patterns.append(self.context.allocator, pattern);
+                    try params.append(self.context.allocator, .{ .string = pattern });
+                    try sql_writer.print("content ILIKE ${} ESCAPE '\\'", .{params.items.len});
                 }
-                try params.append(self.context.allocator, .{ .string = filter.search });
-                try sql_writer.print("content LIKE ('%' || ${} || '%')", .{params.items.len});
             }
 
             if (filter.limit < limit) {
@@ -2213,6 +2261,61 @@ test "NIP-50 search filters live events by content" {
 
     event.content = @constCast("unrelated content");
     try std.testing.expect(!Handler.filterMatches(event, &filter));
+}
+
+test "NIP-50 search is case insensitive and needs every term" {
+    const allocator = std.testing.allocator;
+    var filter = Filter.init(allocator);
+    defer filter.deinit();
+    filter.search = try allocator.dupe(u8, "Google Cloud");
+
+    var no_tags = [_][][]u8{};
+    var event = testEventWithTags(&no_tags);
+
+    // both terms present, in either order, in any case
+    event.content = @constCast("an outage in GOOGLE cloud today");
+    try std.testing.expect(Handler.filterMatches(event, &filter));
+    event.content = @constCast("cloud, and separately google");
+    try std.testing.expect(Handler.filterMatches(event, &filter));
+
+    // only one of the two terms is not enough
+    event.content = @constCast("google photos");
+    try std.testing.expect(!Handler.filterMatches(event, &filter));
+}
+
+test "NIP-50 search matches inside a run of non-ASCII characters" {
+    const allocator = std.testing.allocator;
+    var filter = Filter.init(allocator);
+    defer filter.deinit();
+    filter.search = try allocator.dupe(u8, "レバノン");
+
+    var no_tags = [_][][]u8{};
+    var event = testEventWithTags(&no_tags);
+    event.content = @constCast("レバノン案件取りたいなあ");
+    try std.testing.expect(Handler.filterMatches(event, &filter));
+
+    event.content = @constCast("まったく別の話");
+    try std.testing.expect(!Handler.filterMatches(event, &filter));
+}
+
+test "NIP-50 likePattern escapes the LIKE wildcards" {
+    const allocator = std.testing.allocator;
+
+    const pct = try likePattern(allocator, "100%");
+    defer allocator.free(pct);
+    try std.testing.expectEqualStrings("%100\\%%", pct);
+
+    const underscore = try likePattern(allocator, "a_b");
+    defer allocator.free(underscore);
+    try std.testing.expectEqualStrings("%a\\_b%", underscore);
+
+    const backslash = try likePattern(allocator, "a\\b");
+    defer allocator.free(backslash);
+    try std.testing.expectEqualStrings("%a\\\\b%", backslash);
+
+    const plain = try likePattern(allocator, "abc");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("%abc%", plain);
 }
 
 test "NIP-45 COUNT response includes an escaped subscription id" {
