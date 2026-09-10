@@ -21,6 +21,15 @@ const Config = struct {
     relay_countries: []const []const u8 = &.{"JP"},
 };
 
+/// `std.crypto.random` keeps its CSPRNG state in a `threadlocal` page that it
+/// mmaps on first use and never unmaps when the thread exits. We run a thread
+/// per connection, so every client would strand one page for the lifetime of
+/// the process. Seeding straight from the OS keeps the per-thread state from
+/// being created at all.
+pub const std_options: std.Options = .{
+    .crypto_always_getrandom = true,
+};
+
 var shutdown_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var relay_context: *relay.Context = undefined;
 
