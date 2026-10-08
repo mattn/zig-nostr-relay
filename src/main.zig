@@ -174,6 +174,9 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, peer: std.net.Address, request
     defer allocator.free(reader_buf);
 
     var reader = websocket.proto.Reader.init(reader_buf, @constCast(&buffer_provider), null);
+    // Frees any partially assembled fragmented message (left behind when the
+    // loop exits on TooLarge or a closed connection) and any large buffer.
+    defer reader.deinit();
 
     main_loop: while (true) {
         // Fill buffer with new data
