@@ -325,6 +325,9 @@ const Nip11Response = struct {
     software: []const u8 = "https://github.com/mattn/zig-nostr-relay",
     version: []const u8 = "0.1.0",
     relay_countries: []const []const u8,
+    limitation: struct {
+        max_message_length: usize = relay.max_message_size,
+    } = .{},
 };
 
 // NIP-11 response body length, computed at startup so the HEAD
