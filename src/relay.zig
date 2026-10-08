@@ -415,6 +415,10 @@ pub const Subscriber = struct {
     }
 };
 
+// Largest client message accepted, whether it arrives as one frame or
+// reassembled from fragments.
+pub const max_message_size: usize = 512 * 1024;
+
 pub const Config = struct {
     relay_name: []const u8,
     relay_description: []const u8,
@@ -2005,8 +2009,7 @@ pub const Handler = struct {
             return;
         }
 
-        // Limit message size to 256KB to avoid websocket frame size issues
-        if (data.len > 256 * 1024) {
+        if (data.len > max_message_size) {
             try self.conn.write("[\"NOTICE\", \"error: message too large\"]");
             return;
         }
