@@ -168,9 +168,10 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, peer: std.net.Address, request
 
     // Handle WebSocket messages
     // Use larger reader buffer to handle bigger frames
-    var buffer_provider = try websocket.bufferProvider(allocator, .{});
+    // max caps a fragmented message once reassembled (the default is 64KB).
+    var buffer_provider = try websocket.bufferProvider(allocator, .{ .max = relay.max_message_size });
     defer buffer_provider.deinit();
-    const reader_buf = try allocator.alloc(u8, 512 * 1024); // 512KB buffer
+    const reader_buf = try allocator.alloc(u8, relay.max_message_size);
     defer allocator.free(reader_buf);
 
     var reader = websocket.proto.Reader.init(reader_buf, @constCast(&buffer_provider), null);
