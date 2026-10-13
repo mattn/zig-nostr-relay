@@ -8,6 +8,9 @@ const struct_env = @import("struct-env");
 const relay = @import("relay.zig");
 const logger = @import("logger.zig");
 
+/// Idle clients are pinged after this many seconds without traffic.
+const ping_interval_secs = 30;
+
 const Config = struct {
     database_url: []const u8 = "",
     relay_addr: []const u8 = "0.0.0.0",
@@ -133,6 +136,14 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, peer: std.net.Address, request
         .usec = 0,
     })) catch {};
 
+    // Wake up from read() after this long without traffic so an idle client
+    // gets a ping; keeps proxies such as Cloudflare (100s idle cutoff) from
+    // dropping the connection.
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &std.mem.toBytes(std.posix.timeval{
+        .sec = ping_interval_secs,
+        .usec = 0,
+    })) catch {};
+
     // Create a Conn wrapper for the stream (allocate on heap for thread safety)
     var conn = try allocator.create(Conn);
     defer allocator.destroy(conn);
@@ -182,8 +193,11 @@ fn handleWebSocketUpgrade(stream: std.net.Stream, peer: std.net.Address, request
     main_loop: while (true) {
         // Fill buffer with new data
         reader.fill(stream) catch |err| {
-            // WouldBlock means no data available (non-blocking socket), retry the read
+            // WouldBlock means the receive timeout expired with no data.
+            // fill() leaves the reader untouched on error, so just ping and retry.
             if (err == error.WouldBlock) {
+                var ping_payload = [_]u8{};
+                conn.writePing(&ping_payload) catch break :main_loop;
                 continue;
             }
             logger.debug("reader.fill error: {s}", .{@errorName(err)});
