@@ -18,6 +18,18 @@ pub const Level = enum {
     }
 };
 
+var min_level: Level = .info;
+var min_level_once = std.once(initMinLevel);
+
+/// Reads LOG_LEVEL (debug/info/warn/error) once; defaults to info.
+fn initMinLevel() void {
+    const v = std.posix.getenv("LOG_LEVEL") orelse return;
+    min_level = if (std.ascii.eqlIgnoreCase(v, "error"))
+        .err
+    else
+        std.meta.stringToEnum(Level, v) orelse .info;
+}
+
 fn getTimestamp(buf: []u8) ![]const u8 {
     const now = std.time.timestamp();
     const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(now) };
@@ -36,6 +48,9 @@ fn getTimestamp(buf: []u8) ![]const u8 {
 }
 
 pub fn log(level: Level, comptime fmt: []const u8, args: anytype) void {
+    min_level_once.call();
+    if (@intFromEnum(level) < @intFromEnum(min_level)) return;
+
     log_mutex.lock();
     defer log_mutex.unlock();
 
