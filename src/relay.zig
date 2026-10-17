@@ -337,6 +337,8 @@ const Filter = struct {
     until: i64 = 0,
     limit: i64 = 0,
     search: []const u8 = undefined,
+    // NIP-01: an empty ids/authors/kinds/tag list can never be satisfied.
+    match_nothing: bool = false,
     allocator: std.mem.Allocator,
 
     pub fn empty(self: *const Filter) bool {
@@ -1133,6 +1135,7 @@ pub const Handler = struct {
     }
 
     fn filterMatches(event: Event, filter: *Filter) bool {
+        if (filter.match_nothing) return false;
         // Each condition in a filter is AND'd together
         if (filter.ids.items.len > 0 and !idInSlice(filter.ids.items, event.id)) return false;
         if (filter.authors.items.len > 0 and !idInSlice(filter.authors.items, event.pubkey)) return false;
@@ -1418,6 +1421,7 @@ pub const Handler = struct {
                 if (std.mem.eql(u8, key, "ids")) {
                     const ids = elem.object.get(key);
                     if (ids.? != .array) continue;
+                    if (ids.?.array.items.len == 0) filter.match_nothing = true;
                     for (ids.?.array.items) |id| {
                         if (id != .string) continue;
                         try filter.ids.append(allocator, try allocator.dupe(u8, id.string));
@@ -1425,6 +1429,7 @@ pub const Handler = struct {
                 } else if (std.mem.eql(u8, key, "authors")) {
                     const authors = elem.object.get(key);
                     if (authors.? != .array) continue;
+                    if (authors.?.array.items.len == 0) filter.match_nothing = true;
                     for (authors.?.array.items) |pubkey| {
                         if (pubkey != .string) continue;
                         try filter.authors.append(allocator, try allocator.dupe(u8, pubkey.string));
@@ -1443,6 +1448,7 @@ pub const Handler = struct {
                 } else if (std.mem.startsWith(u8, key, "#")) {
                     const tag = elem.object.get(key);
                     if (tag.? != .array) continue;
+                    if (tag.?.array.items.len == 0) filter.match_nothing = true;
                     var newarr = std.ArrayList([]const u8){};
                     try newarr.append(allocator, try allocator.dupe(u8, key[1..]));
                     for (tag.?.array.items) |v| {
@@ -1452,6 +1458,7 @@ pub const Handler = struct {
                 } else if (std.mem.eql(u8, key, "kinds")) {
                     const kinds = elem.object.get(key);
                     if (kinds.? != .array) continue;
+                    if (kinds.?.array.items.len == 0) filter.match_nothing = true;
                     for (kinds.?.array.items) |kind| {
                         if (kind != .integer) continue;
                         try filter.kinds.append(allocator, kind.integer);
@@ -1734,7 +1741,10 @@ pub const Handler = struct {
 
         var has_where = false;
         var limit: i64 = 500;
+        var satisfiable: usize = 0;
         for (filters.items) |filter| {
+            if (filter.match_nothing) continue;
+            satisfiable += 1;
             if (filter.ids.items.len > 0) {
                 if (!has_where) {
                     try sql_writer.writeAll(" WHERE ");
@@ -1836,6 +1846,12 @@ pub const Handler = struct {
             if (filter.limit < limit) {
                 limit = filter.limit;
             }
+        }
+
+        // Only unsatisfiable filters: the query must return nothing.
+        if (satisfiable == 0) {
+            try sql_writer.writeAll(" WHERE FALSE");
+            has_where = true;
         }
 
         // A broad filter or an id-only lookup can also match gift wraps.
@@ -2249,6 +2265,29 @@ test "eventIsExpired honors the expiration tag" {
     var bogus_tag = [_][]u8{ @constCast("expiration"), @constCast("not-a-number") };
     var bogus_tags = [_][][]u8{&bogus_tag};
     try std.testing.expect(!eventIsExpired(testEventWithTags(&bogus_tags), 1700000000));
+}
+
+test "NIP-01 empty filter lists match nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var no_tags = [_][][]u8{};
+    const event = testEventWithTags(&no_tags);
+    const cases = [_]struct { json: []const u8, match_nothing: bool }{
+        .{ .json = "{\"limit\":3}", .match_nothing = false },
+        .{ .json = "{\"kinds\":[]}", .match_nothing = true },
+        .{ .json = "{\"authors\":[]}", .match_nothing = true },
+        .{ .json = "{\"ids\":[]}", .match_nothing = true },
+        .{ .json = "{\"#e\":[]}", .match_nothing = true },
+    };
+    for (cases) |c| {
+        const req = try std.fmt.allocPrint(allocator, "[\"REQ\",\"s\",{s}]", .{c.json});
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, req, .{});
+        const filters = try Handler.make_filter(allocator, parsed.array);
+        try std.testing.expectEqual(c.match_nothing, filters.items[0].match_nothing);
+        try std.testing.expectEqual(!c.match_nothing, Handler.filterMatches(event, filters.items[0]));
+    }
 }
 
 test "NIP-50 search filters live events by content" {
