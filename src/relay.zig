@@ -316,6 +316,15 @@ const Event = struct {
 
 /// NIP-50: wrap a search term as a LIKE pattern, escaping the wildcards so a
 /// search for "%" cannot match every event. Caller owns the result.
+// Writes "$first,...,$last" for a run of already bound parameters.
+fn writeParamList(writer: anytype, first: usize, last: usize) !void {
+    var i = first;
+    while (i <= last) : (i += 1) {
+        if (i > first) try writer.writeAll(",");
+        try writer.print("${}", .{i});
+    }
+}
+
 fn likePattern(allocator: std.mem.Allocator, term: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .{};
     errdefer out.deinit(allocator);
@@ -1111,13 +1120,22 @@ pub const Handler = struct {
         return false;
     }
 
-    fn tagsInSlice(haystack: [][][]const u8, needle: [][][]u8) bool {
-        for (needle) |tag| {
-            for (haystack) |item| {
-                if (item.len != 2) continue;
-                if (std.mem.eql(u8, item[0], tag[0]) and std.mem.eql(u8, item[1], tag[1])) {
-                    return true;
-                }
+    // NIP-01: every tag condition of a filter must hold, and a condition
+    // such as {"#e": [a, b]} holds when the event has an "e" tag whose value
+    // is a or b. Each condition is stored as [name, values...].
+    fn tagsInSlice(conditions: [][][]const u8, event_tags: [][][]u8) bool {
+        for (conditions) |condition| {
+            if (condition.len < 2) return false;
+            if (!tagConditionHolds(condition, event_tags)) return false;
+        }
+        return true;
+    }
+
+    fn tagConditionHolds(condition: [][]const u8, event_tags: [][][]u8) bool {
+        for (event_tags) |tag| {
+            if (tag.len < 2 or !std.mem.eql(u8, tag[0], condition[0])) continue;
+            for (condition[1..]) |value| {
+                if (std.mem.eql(u8, tag[1], value)) return true;
             }
         }
         return false;
@@ -1789,16 +1807,25 @@ pub const Handler = struct {
                 }
                 try sql_writer.writeAll(")");
             }
-            if (filter.tags.items.len > 0) {
-                try sql_writer.writeAll(" AND tagvalues && ARRAY[");
-                for (filter.tags.items) |tag| {
-                    for (tag, 0..) |v, i| {
-                        if (i > 0) try sql_writer.writeAll(",");
-                        try params.append(self.context.allocator, .{ .string = v });
-                        try sql_writer.print("${}", .{params.items.len});
-                    }
+            // Each tag condition is [name, values...]: the event needs a tag
+            // with that name and one of the values, and all conditions must
+            // hold. tagvalues (single-letter tags only) lets the GIN index
+            // narrow the rows before the exact check.
+            for (filter.tags.items) |tag| {
+                try params.append(self.context.allocator, .{ .string = tag[0] });
+                const name_param = params.items.len;
+                const first_value_param = params.items.len + 1;
+                for (tag[1..]) |v| {
+                    try params.append(self.context.allocator, .{ .string = v });
                 }
-                try sql_writer.writeAll("]");
+                if (tag[0].len == 1) {
+                    try sql_writer.writeAll(" AND tagvalues && ARRAY[");
+                    try writeParamList(sql_writer, first_value_param, params.items.len);
+                    try sql_writer.writeAll("]");
+                }
+                try sql_writer.print(" AND EXISTS (SELECT 1 FROM jsonb_array_elements(tags) t WHERE t->>0 = ${} AND t->>1 IN (", .{name_param});
+                try writeParamList(sql_writer, first_value_param, params.items.len);
+                try sql_writer.writeAll("))");
             }
             if (filter.since > 0) {
                 try params.append(self.context.allocator, .{ .number = filter.since });
@@ -2249,6 +2276,41 @@ test "NIP-01 empty filter lists match nothing" {
         const filters = try Handler.make_filter(allocator, parsed.array);
         try std.testing.expectEqual(c.match_nothing, filters.items[0].match_nothing);
         try std.testing.expectEqual(!c.match_nothing, Handler.filterMatches(event, filters.items[0]));
+    }
+}
+
+test "NIP-01 tag filters check the tag name and AND every condition" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var e_tag = [_][]u8{ @constCast("e"), @constCast("aaa"), @constCast("wss://relay") };
+    var p_tag = [_][]u8{ @constCast("p"), @constCast("bbb") };
+    var t_tag = [_][]u8{ @constCast("t"), @constCast("nostr") };
+    var tags = [_][][]u8{ &e_tag, &p_tag, &t_tag };
+    const event = testEventWithTags(&tags);
+
+    const cases = [_]struct { json: []const u8, matches: bool }{
+        .{ .json = "{\"#e\":[\"aaa\"]}", .matches = true },
+        // the value is only present under another tag name
+        .{ .json = "{\"#e\":[\"bbb\"]}", .matches = false },
+        // the tag name itself is not a value
+        .{ .json = "{\"#p\":[\"p\"]}", .matches = false },
+        // any of the values is enough
+        .{ .json = "{\"#p\":[\"zzz\",\"bbb\"]}", .matches = true },
+        // every condition must hold
+        .{ .json = "{\"#e\":[\"aaa\"],\"#t\":[\"nostr\"]}", .matches = true },
+        .{ .json = "{\"#e\":[\"aaa\"],\"#t\":[\"other\"]}", .matches = false },
+        .{ .json = "{\"#x\":[\"aaa\"]}", .matches = false },
+    };
+    for (cases) |c| {
+        const req = try std.fmt.allocPrint(allocator, "[\"REQ\",\"s\",{s}]", .{c.json});
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, allocator, req, .{});
+        const filters = try Handler.make_filter(allocator, parsed.array);
+        std.testing.expectEqual(c.matches, Handler.filterMatches(event, filters.items[0])) catch |err| {
+            std.debug.print("filter {s}\n", .{c.json});
+            return err;
+        };
     }
 }
 
