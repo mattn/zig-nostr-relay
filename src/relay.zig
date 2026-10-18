@@ -1652,6 +1652,18 @@ pub const Handler = struct {
         try self.conn.write(buf.items);
     }
 
+    // A broad filter or an id-only lookup can also match gift wraps. Never
+    // serve kind 1059 unless this connection authenticated as the event's
+    // p-tagged recipient.
+    fn writeGiftWrapGuard(self: *Handler, sql_writer: anytype, params: anytype) !void {
+        if (self.authed_pubkey) |recipient| {
+            try params.append(self.context.allocator, .{ .string = recipient[0..] });
+            try sql_writer.print("(kind <> 1059 OR exists (select 1 from jsonb_array_elements(tags) t where t->>0 = 'p' and t->>1 = ${}))", .{params.items.len});
+        } else {
+            try sql_writer.writeAll("kind <> 1059");
+        }
+    }
+
     fn handleQuery(self: *Handler, value: std.json.Value, count_only: bool) !void {
         if (value.array.items.len < 3) {
             try self.conn.write("[\"NOTICE\", \"error: invalid request\"]");
@@ -1737,22 +1749,21 @@ pub const Handler = struct {
         defer sqlbuf.deinit(self.context.allocator);
         const sql_writer = sqlbuf.writer(self.context.allocator);
 
-        try sql_writer.writeAll("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event");
+        // NIP-01: filters are OR'd and each filter's limit applies to that
+        // filter alone, so every filter becomes its own subquery with its own
+        // LIMIT and the subqueries are combined with UNION, which also sends
+        // an event matching several filters only once.
+        try sql_writer.writeAll("SELECT id, pubkey, created_at, kind, tags, content, sig FROM (");
 
-        var has_where = false;
-        var limit: i64 = 500;
-        var satisfiable: usize = 0;
+        var subqueries: usize = 0;
         for (filters.items) |filter| {
             if (filter.match_nothing) continue;
-            satisfiable += 1;
+            if (subqueries > 0) try sql_writer.writeAll(" UNION ");
+            subqueries += 1;
+            try sql_writer.writeAll("(SELECT id, pubkey, created_at, kind, tags, content, sig FROM event WHERE ");
+            try self.writeGiftWrapGuard(sql_writer, &params);
             if (filter.ids.items.len > 0) {
-                if (!has_where) {
-                    try sql_writer.writeAll(" WHERE ");
-                    has_where = true;
-                } else {
-                    try sql_writer.writeAll(" AND ");
-                }
-                try sql_writer.writeAll("id IN (");
+                try sql_writer.writeAll(" AND id IN (");
                 for (filter.ids.items, 0..) |id, i| {
                     if (i > 0) try sql_writer.writeAll(",");
                     try params.append(self.context.allocator, .{ .string = id });
@@ -1761,13 +1772,7 @@ pub const Handler = struct {
                 try sql_writer.writeAll(")");
             }
             if (filter.authors.items.len > 0) {
-                if (!has_where) {
-                    try sql_writer.writeAll(" WHERE ");
-                    has_where = true;
-                } else {
-                    try sql_writer.writeAll(" AND ");
-                }
-                try sql_writer.writeAll("pubkey IN (");
+                try sql_writer.writeAll(" AND pubkey IN (");
                 for (filter.authors.items, 0..) |pubkey, i| {
                     if (i > 0) try sql_writer.writeAll(",");
                     try params.append(self.context.allocator, .{ .string = pubkey });
@@ -1776,13 +1781,7 @@ pub const Handler = struct {
                 try sql_writer.writeAll(")");
             }
             if (filter.kinds.items.len > 0) {
-                if (!has_where) {
-                    try sql_writer.writeAll(" WHERE ");
-                    has_where = true;
-                } else {
-                    try sql_writer.writeAll(" AND ");
-                }
-                try sql_writer.writeAll("kind IN (");
+                try sql_writer.writeAll(" AND kind IN (");
                 for (filter.kinds.items, 0..) |kind, i| {
                     if (i > 0) try sql_writer.writeAll(",");
                     try params.append(self.context.allocator, .{ .number = kind });
@@ -1791,13 +1790,7 @@ pub const Handler = struct {
                 try sql_writer.writeAll(")");
             }
             if (filter.tags.items.len > 0) {
-                if (!has_where) {
-                    try sql_writer.writeAll(" WHERE ");
-                    has_where = true;
-                } else {
-                    try sql_writer.writeAll(" AND ");
-                }
-                try sql_writer.writeAll("tagvalues && ARRAY[");
+                try sql_writer.writeAll(" AND tagvalues && ARRAY[");
                 for (filter.tags.items) |tag| {
                     for (tag, 0..) |v, i| {
                         if (i > 0) try sql_writer.writeAll(",");
@@ -1808,69 +1801,38 @@ pub const Handler = struct {
                 try sql_writer.writeAll("]");
             }
             if (filter.since > 0) {
-                if (!has_where) {
-                    try sql_writer.writeAll(" WHERE ");
-                    has_where = true;
-                } else {
-                    try sql_writer.writeAll(" AND ");
-                }
                 try params.append(self.context.allocator, .{ .number = filter.since });
-                try sql_writer.print("created_at >= ${}", .{params.items.len});
+                try sql_writer.print(" AND created_at >= ${}", .{params.items.len});
             }
             if (filter.until > 0) {
-                if (!has_where) {
-                    try sql_writer.writeAll(" WHERE ");
-                    has_where = true;
-                } else {
-                    try sql_writer.writeAll(" AND ");
-                }
                 try params.append(self.context.allocator, .{ .number = filter.until });
-                try sql_writer.print("created_at <= ${}", .{params.items.len});
+                try sql_writer.print(" AND created_at <= ${}", .{params.items.len});
             }
             if (filter.search.len > 0) {
                 var it = std.mem.tokenizeAny(u8, filter.search, " \t\n\r");
                 while (it.next()) |term| {
-                    if (!has_where) {
-                        try sql_writer.writeAll(" WHERE ");
-                        has_where = true;
-                    } else {
-                        try sql_writer.writeAll(" AND ");
-                    }
                     const pattern = try likePattern(self.context.allocator, term);
                     try patterns.append(self.context.allocator, pattern);
                     try params.append(self.context.allocator, .{ .string = pattern });
-                    try sql_writer.print("content ILIKE ${} ESCAPE '\\'", .{params.items.len});
+                    try sql_writer.print(" AND content ILIKE ${} ESCAPE '\\'", .{params.items.len});
                 }
             }
 
-            if (filter.limit < limit) {
-                limit = filter.limit;
+            if (!count_only) {
+                const limit: i64 = if (filter.limit >= 0 and filter.limit < 500) filter.limit else 500;
+                try sql_writer.print(" ORDER BY created_at DESC LIMIT {}", .{limit});
             }
+            try sql_writer.writeAll(")");
         }
 
         // Only unsatisfiable filters: the query must return nothing.
-        if (satisfiable == 0) {
-            try sql_writer.writeAll(" WHERE FALSE");
-            has_where = true;
+        if (subqueries == 0) {
+            try sql_writer.writeAll("SELECT id, pubkey, created_at, kind, tags, content, sig FROM event WHERE FALSE");
         }
 
-        // A broad filter or an id-only lookup can also match gift wraps.
-        // Never serve kind 1059 unless this connection authenticated as the
-        // event's p-tagged recipient.
-        if (!has_where) {
-            try sql_writer.writeAll(" WHERE ");
-        } else {
-            try sql_writer.writeAll(" AND ");
-        }
-        if (self.authed_pubkey) |recipient| {
-            try params.append(self.context.allocator, .{ .string = recipient[0..] });
-            try sql_writer.print("(kind <> 1059 OR exists (select 1 from jsonb_array_elements(tags) t where t->>0 = 'p' and t->>1 = ${}))", .{params.items.len});
-        } else {
-            try sql_writer.writeAll("kind <> 1059");
-        }
-
+        try sql_writer.writeAll(") AS matched");
         if (!count_only) {
-            try sql_writer.print(" ORDER BY created_at DESC LIMIT {}", .{limit});
+            try sql_writer.writeAll(" ORDER BY created_at DESC");
         }
 
         // Collect all event messages in memory first, then release DB connection
