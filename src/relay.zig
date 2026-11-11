@@ -438,6 +438,7 @@ pub const Config = struct {
     relay_contact: []const u8,
     relay_icon: []const u8,
     relay_countries: []const []const u8,
+    min_pow_difficulty: u32 = 0,
 };
 
 pub const Context = struct {
@@ -602,6 +603,29 @@ fn verifyDelegationSignature(delegatee_pubkey: []const u8, delegator_pubkey: []c
     sha256.final(&msgbuf);
 
     return verify(bytes_pk, msgbuf, bytes_sig) catch false;
+}
+
+// NIP-13: proof of work difficulty is the number of leading zero bits of
+// the hex event id. Only the id is checked; whether a nonce tag commits to
+// the same target is the publishing client's business.
+fn powDifficulty(id: []const u8) u32 {
+    var bits: u32 = 0;
+    for (id) |c| {
+        const n = std.fmt.charToDigit(c, 16) catch break;
+        if (n == 0) {
+            bits += 4;
+            continue;
+        }
+        if (n <= 1) {
+            bits += 3;
+        } else if (n <= 3) {
+            bits += 2;
+        } else if (n <= 7) {
+            bits += 1;
+        }
+        break;
+    }
+    return bits;
 }
 
 // NIP-22: Event created_at Limits
@@ -1529,6 +1553,19 @@ pub const Handler = struct {
         }
         logger.debug("Event signature verified", .{});
 
+        // NIP-13: demand a minimum proof of work
+        const min_pow = self.context.config.min_pow_difficulty;
+        if (min_pow > 0) {
+            const difficulty = powDifficulty(ev.id);
+            if (difficulty < min_pow) {
+                logger.warn("[{s}] Event rejected: pow difficulty {d} < {d}", .{ self.client_ip, difficulty, min_pow });
+                var msg_buf: [96]u8 = undefined;
+                const msg = try std.fmt.bufPrint(&msg_buf, "pow: difficulty {d} is less than {d}", .{ difficulty, min_pow });
+                try self.sendOk(ev.id, false, msg);
+                return;
+            }
+        }
+
         // NIP-70: protected events may only be published by their author over
         // a connection authenticated (NIP-42) as that author.
         const authed: ?[]const u8 = if (self.authed_pubkey) |*pk| pk[0..] else null;
@@ -2236,6 +2273,20 @@ fn testEventWithTags(tags: [][][]u8) Event {
         .sig = @constCast(""),
         .tags = tags,
     };
+}
+
+test "powDifficulty counts leading zero bits of the id" {
+    try std.testing.expectEqual(@as(u32, 0), powDifficulty("ffffffff"));
+    try std.testing.expectEqual(@as(u32, 1), powDifficulty("7fffffff"));
+    try std.testing.expectEqual(@as(u32, 2), powDifficulty("3fffffff"));
+    try std.testing.expectEqual(@as(u32, 3), powDifficulty("1fffffff"));
+    try std.testing.expectEqual(@as(u32, 4), powDifficulty("0fffffff"));
+    try std.testing.expectEqual(@as(u32, 8), powDifficulty("00ffffff"));
+    try std.testing.expectEqual(@as(u32, 10), powDifficulty("002fffff"));
+    try std.testing.expectEqual(@as(u32, 36), powDifficulty("000000000e9d897a3aa5f"));
+    try std.testing.expectEqual(@as(u32, 64), powDifficulty("0000000000000000"));
+    try std.testing.expectEqual(@as(u32, 0), powDifficulty(""));
+    try std.testing.expectEqual(@as(u32, 8), powDifficulty("00zz"));
 }
 
 test "eventIsExpired honors the expiration tag" {
