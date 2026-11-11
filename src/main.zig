@@ -22,6 +22,8 @@ const Config = struct {
     relay_contact: []const u8 = "",
     relay_icon: []const u8 = "",
     relay_countries: []const []const u8 = &.{"JP"},
+    // NIP-13: minimum leading zero bits of the event id; 0 disables the check
+    min_pow_difficulty: u32 = 0,
 };
 
 /// `std.crypto.random` keeps its CSPRNG state in a `threadlocal` page that it
@@ -335,12 +337,13 @@ const Nip11Response = struct {
     icon: ?[]const u8 = null,
     // NIP-17's relay requirement is fulfilled by the NIP-42/NIP-59
     // recipient-only handling of kind 1059 gift wraps.
-    supported_nips: [14]u32 = [_]u32{ 1, 4, 9, 11, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78 },
+    supported_nips: [15]u32 = [_]u32{ 1, 4, 9, 11, 13, 17, 26, 40, 42, 45, 50, 59, 66, 70, 78 },
     software: []const u8 = "https://github.com/mattn/zig-nostr-relay",
     version: []const u8 = "0.1.0",
     relay_countries: []const []const u8,
     limitation: struct {
         max_message_length: usize = relay.max_message_size,
+        min_pow_difficulty: u32 = 0,
     } = .{},
 };
 
@@ -357,6 +360,7 @@ fn buildNip11Json(allocator: std.mem.Allocator, json_buf: *std.ArrayList(u8)) !v
         .url = if (relay_context.config.relay_url.len > 0) relay_context.config.relay_url else null,
         .icon = if (relay_context.config.relay_icon.len > 0) relay_context.config.relay_icon else null,
         .relay_countries = relay_context.config.relay_countries,
+        .limitation = .{ .min_pow_difficulty = relay_context.config.min_pow_difficulty },
     };
 
     try std.fmt.format(json_buf.writer(allocator), "{f}", .{std.json.fmt(response_data, .{})});
@@ -570,6 +574,7 @@ pub fn main() !void {
             .relay_contact = env.relay_contact,
             .relay_icon = env.relay_icon,
             .relay_countries = env.relay_countries,
+            .min_pow_difficulty = env.min_pow_difficulty,
         },
     };
     relay_context = &context;
