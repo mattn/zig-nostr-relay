@@ -1711,7 +1711,7 @@ pub const Handler = struct {
     // serve kind 1059 unless this connection authenticated as the event's
     // p-tagged recipient.
     fn writeGiftWrapGuard(self: *Handler, sql_writer: anytype, params: anytype) !void {
-        if (self.authed_pubkey) |recipient| {
+        if (self.authed_pubkey) |*recipient| {
             try params.append(self.context.allocator, .{ .string = recipient[0..] });
             try sql_writer.print("(kind <> 1059 OR exists (select 1 from jsonb_array_elements(tags) t where t->>0 = 'p' and t->>1 = ${}))", .{params.items.len});
         } else {
