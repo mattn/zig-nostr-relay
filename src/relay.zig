@@ -1575,6 +1575,13 @@ pub const Handler = struct {
             return;
         }
 
+        // NIP-40: an event that has already expired is not accepted
+        if (eventIsExpired(ev, std.time.timestamp())) {
+            logger.warn("[{s}] Expired event rejected", .{self.client_ip});
+            try self.sendOk(ev.id, false, "invalid: event has expired");
+            return;
+        }
+
         if (!validateDelegation(ev)) {
             logger.warn("Event has invalid delegation", .{});
             var ng_buf: std.ArrayList(u8) = .{};
